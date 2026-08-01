@@ -5,6 +5,12 @@ umask 077
 
 TARGET=/app/config.yaml
 
+# GROK2API_CONFIG_SOURCE 在镜像内由 Dockerfile 的 ENV 提供；但脚本也可能在没有该
+# 环境变量的环境下执行（本地调试、非官方镜像、直接 sh 运行）。在 set -u 下必须给
+# 默认值，否则第 14 行解引用未定义变量会直接 "unbound variable" 崩溃，反而绕过下面
+# 的友好报错分支，与"缺失挂载时不再崩溃"的目标矛盾。
+GROK2API_CONFIG_SOURCE="${GROK2API_CONFIG_SOURCE:-/run/grok2api/config.yaml}"
+
 # 1) 生成运行配置。优先环境变量注入（适配 Zeabur/K8s 等无法方便挂载文件的平台），
 #    否则回退到挂载的配置文件（保持与原行为兼容）。
 if [ -n "${GROK2API_CONFIG_BASE64:-}" ]; then
