@@ -3,7 +3,17 @@ set -eu
 
 umask 077
 
+quality_guard_dir=/var/lib/grok2api-quality-guard
 TARGET=/app/config.yaml
+
+if [ "$(id -u)" = "0" ]; then
+  mkdir -p "${quality_guard_dir}"
+  chown grok2api:grok2api "${quality_guard_dir}"
+  chmod 0700 "${quality_guard_dir}"
+else
+  mkdir -p "${quality_guard_dir}" 2>/dev/null || true
+  chmod 0700 "${quality_guard_dir}" 2>/dev/null || true
+fi
 
 # GROK2API_CONFIG_SOURCE 在镜像内由 Dockerfile 的 ENV 提供；但脚本也可能在没有该
 # 环境变量的环境下执行（本地调试、非官方镜像、直接 sh 运行）。在 set -u 下必须给

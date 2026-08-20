@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"strings"
@@ -49,6 +50,61 @@ func TestConvertChatRequestToResponses(t *testing.T) {
 	tools := payload["tools"].([]any)
 	if len(tools) != 2 || tools[0].(map[string]any)["name"] != "lookup" || tools[0].(map[string]any)["type"] != "function" || tools[1].(map[string]any)["type"] != "web_search" {
 		t.Fatalf("tools = %#v", tools)
+	}
+}
+
+func TestConvertChatPreservesWebSearchExcludedDomains(t *testing.T) {
+	converted, err := ConvertRequest([]byte(`{
+		"model":"public-chat","messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search","filters":{"excluded_domains":["blocked.example"]}}]
+	}`), "grok-4.6", OperationChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(converted, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	domains := tool["filters"].(map[string]any)["excluded_domains"].([]any)
+	if len(domains) != 1 || domains[0] != "blocked.example" {
+		t.Fatalf("excluded_domains = %#v", tool)
+	}
+}
+
+func TestConvertChatValidatesWebSearchDomainFilters(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		tool    string
+		wantErr bool
+	}{
+		{name: "identical nested and top level", tool: `{"type":"web_search","filters":{"allowed_domains":["same.example"]},"allowed_domains":["same.example"]}`},
+		{name: "conflicting duplicate", tool: `{"type":"web_search","filters":{"allowed_domains":["nested.example"]},"allowed_domains":["top.example"]}`, wantErr: true},
+		{name: "allow and exclude", tool: `{"type":"web_search","filters":{"allowed_domains":["allow.example"],"excluded_domains":["deny.example"]}}`, wantErr: true},
+		{name: "six domains", tool: `{"type":"web_search","excluded_domains":["a.example","b.example","c.example","d.example","e.example","f.example"]}`, wantErr: true},
+		{name: "invalid filters type", tool: `{"type":"web_search","filters":"invalid"}`, wantErr: true},
+		{name: "empty filters omitted", tool: `{"type":"web_search","filters":{"allowed_domains":null,"excluded_domains":[]}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := ConvertRequest([]byte(`{
+				"model":"public-chat","messages":[{"role":"user","content":"search"}],
+				"tools":[`+test.tool+`]
+			}`), "grok-4.6", OperationChat)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("conversion error = %v, wantErr %v", err, test.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(converted, &payload); err != nil {
+				t.Fatal(err)
+			}
+			tool := payload["tools"].([]any)[0].(map[string]any)
+			if test.name == "empty filters omitted" && len(tool) != 1 {
+				t.Fatalf("empty filters were not omitted: %#v", tool)
+			}
+		})
 	}
 }
 
@@ -374,7 +430,7 @@ func TestConvertAnthropicClaudeCodeRequestToResponses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !options.AnthropicThinking {
+	if !options.AnthropicThinking || !options.ReasoningEffortSet || options.ReasoningEffort != "high" {
 		t.Fatal("thinking option 未保留")
 	}
 	var payload map[string]any
@@ -403,6 +459,21 @@ func TestConvertAnthropicClaudeCodeRequestToResponses(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicDisabledThinkingReportsNoneMetadata(t *testing.T) {
+	body := []byte(`{
+		"model":"public-chat","max_tokens":1024,
+		"messages":[{"role":"user","content":"hello"}],
+		"thinking":{"type":"disabled"}
+	}`)
+	_, options, err := ConvertRequestWithOptions(body, "grok-4.3", OperationMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.AnthropicThinking || !options.ReasoningEffortSet || options.ReasoningEffort != "none" {
+		t.Fatalf("options = %#v", options)
+	}
+}
+
 func TestConvertAnthropicMessagesPreservesExtendedReasoningEffort(t *testing.T) {
 	for _, effort := range []string{"xhigh", "max"} {
 		t.Run(effort, func(t *testing.T) {
@@ -425,6 +496,26 @@ func TestConvertAnthropicMessagesPreservesExtendedReasoningEffort(t *testing.T) 
 				t.Fatalf("reasoning = %#v", payload["reasoning"])
 			}
 		})
+	}
+}
+
+func TestConvertAnthropicMessagesUsesThinkingEffortBeforeBudget(t *testing.T) {
+	body := []byte(`{
+		"model":"public-chat","max_tokens":1024,
+		"messages":[{"role":"user","content":"hello"}],
+		"thinking":{"type":"enabled","effort":"high","budget_tokens":1024}
+	}`)
+	converted, options, err := ConvertRequestWithOptions(body, "grok-4.5", OperationMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if json.Unmarshal(converted, &payload) != nil {
+		t.Fatalf("converted = %s", converted)
+	}
+	reasoning, _ := payload["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || !options.ReasoningEffortSet || options.ReasoningEffort != "high" {
+		t.Fatalf("reasoning = %#v, options = %#v", reasoning, options)
 	}
 }
 
@@ -511,6 +602,28 @@ func TestConvertAnthropicWebSearchControls(t *testing.T) {
 	if len(tool) != 1 || tool["type"] != "web_search" {
 		t.Fatalf("downgraded tool = %#v", tool)
 	}
+
+	converted, _, err = ConvertRequestWithOptions([]byte(`{
+		"model":"public","max_tokens":64,"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","blocked_domains":["blocked.example"]}]
+	}`), "grok-4.6", OperationMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = nil
+	_ = json.Unmarshal(converted, &payload)
+	tool = payload["tools"].([]any)[0].(map[string]any)
+	domains = tool["filters"].(map[string]any)["excluded_domains"].([]any)
+	if len(domains) != 1 || domains[0] != "blocked.example" {
+		t.Fatalf("blocked_domains conversion = %#v", tool)
+	}
+
+	if _, _, err = ConvertRequestWithOptions([]byte(`{
+		"model":"public","max_tokens":64,"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","allowed_domains":["allow.example"],"blocked_domains":["blocked.example"]}]
+	}`), "grok-4.6", OperationMessages); err == nil {
+		t.Fatal("allowed_domains + blocked_domains must be rejected")
+	}
 }
 
 func TestConvertResponsesJSONToChatAndMessages(t *testing.T) {
@@ -559,6 +672,10 @@ func TestConvertResponsesJSONToChatAndMessages(t *testing.T) {
 	if messagesUsage["input_tokens"] != float64(8) || messagesUsage["cache_read_input_tokens"] != float64(2) {
 		t.Fatalf("messages cache usage = %#v", messagesUsage)
 	}
+	outputDetails, ok := messagesUsage["output_tokens_details"].(map[string]any)
+	if !ok || outputDetails["thinking_tokens"] != float64(1) {
+		t.Fatalf("messages thinking usage = %#v", messagesUsage)
+	}
 }
 
 func TestAnthropicUsageClampsCacheReadToTotalInput(t *testing.T) {
@@ -568,6 +685,20 @@ func TestAnthropicUsageClampsCacheReadToTotalInput(t *testing.T) {
 	converted := anthropicUsage(usage, 0)
 	if converted["input_tokens"] != int64(0) || converted["cache_read_input_tokens"] != int64(10) {
 		t.Fatalf("clamped messages usage = %#v", converted)
+	}
+	outputDetails, ok := converted["output_tokens_details"].(map[string]any)
+	if !ok || outputDetails["thinking_tokens"] != int64(0) {
+		t.Fatalf("non-reasoning messages usage = %#v", converted)
+	}
+}
+
+func TestAnthropicUsageClampsThinkingTokensToOutputTokens(t *testing.T) {
+	usage := responseUsage{OutputTokens: 5}
+	usage.OutputTokensDetails.ReasoningTokens = 8
+	converted := anthropicUsage(usage, 0)
+	outputDetails := converted["output_tokens_details"].(map[string]any)
+	if outputDetails["thinking_tokens"] != int64(5) {
+		t.Fatalf("clamped thinking usage = %#v", converted)
 	}
 }
 
@@ -768,6 +899,177 @@ func TestConvertResponsesStreamChatErrorIsTerminal(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesStreamMarksChatReasoningStart(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"hi"}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, ": grok2api-reasoning-start\n\n") != 1 {
+		t.Fatalf("expected one reasoning start marker: %s", text)
+	}
+	if strings.Contains(text, "reasoning_started") {
+		t.Fatalf("internal timing marker leaked into Chat JSON: %s", text)
+	}
+	if !strings.Contains(text, `"content":"hi"`) {
+		t.Fatalf("missing visible content: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamMarksEncryptedChatReasoningEvidence(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"signature"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, ": grok2api-reasoning-start\n\n") != 1 || strings.Count(text, ": grok2api-reasoning-evidence\n\n") != 1 {
+		t.Fatalf("encrypted reasoning markers missing or duplicated: %s", text)
+	}
+	if strings.Contains(text, "signature") || strings.Contains(text, "encrypted_content") {
+		t.Fatalf("encrypted reasoning leaked into Chat JSON: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamMarksFinalEnvelopeReasoningEvidence(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed","output":[{"id":"rs_1","type":"reasoning","encrypted_content":"signature"}]}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, ": grok2api-reasoning-evidence\n\n") != 1 {
+		t.Fatalf("final-envelope reasoning evidence missing or duplicated: %s", text)
+	}
+	if strings.Contains(text, "signature") || strings.Contains(text, "encrypted_content") {
+		t.Fatalf("final-envelope encrypted reasoning leaked into Chat JSON: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamChatPrefersRawReasoningOverSummary(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"raw "}`, "",
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"reasoning"}`, "",
+		`event: response.reasoning_text.delta`,
+		`data: {"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"raw reasoning"}`, "",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, `"reasoning_content"`) != 1 || strings.Count(text, "raw reasoning") != 1 {
+		t.Fatalf("identical summary/raw reasoning should be emitted exactly once: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamChatFlushesSummaryAtEOF(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"summary only"}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, `"reasoning_content":"summary only"`) != 1 || !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("summary fallback was not finalized at EOF: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamChatAdoptsLateReasoningItemID(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"summary"}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.reasoning_text.delta`,
+		`data: {"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"raw"}`, "",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Contains(text, `"reasoning_content":"summary"`) || strings.Count(text, `"reasoning_content":"raw"`) != 1 {
+		t.Fatalf("late item_id created a second reasoning source: %s", text)
+	}
+}
+
+func TestConvertResponsesStreamMessagesPrefersRawReasoningBeforeSignature(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"duplicated summary"}`, "",
+		`event: response.reasoning_text.delta`,
+		`data: {"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"raw reasoning"}`, "",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"signature"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStreamWithOptions(
+		io.NopCloser(strings.NewReader(stream)), OperationMessages, ResponseOptions{AnthropicThinking: true},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Contains(text, "duplicated summary") {
+		t.Fatalf("summary leaked after raw reasoning was selected: %s", text)
+	}
+	reasoningAt := strings.Index(text, `"thinking":"raw reasoning"`)
+	signatureAt := strings.Index(text, `"signature":"signature"`)
+	stopAt := strings.Index(text, `"type":"content_block_stop"`)
+	if reasoningAt < 0 || signatureAt < reasoningAt || stopAt < signatureAt {
+		t.Fatalf("thinking/signature/block-stop order is invalid: %s", text)
+	}
+}
+
 func TestConvertResponsesStreamMessagesNormalizesTerminalError(t *testing.T) {
 	stream := strings.Join([]string{
 		`event: response.failed`,
@@ -921,7 +1223,7 @@ func TestConvertResponsesStreamMergesPartialUsageFrames(t *testing.T) {
 		want      []string
 	}{
 		{operation: OperationChat, want: []string{`"prompt_tokens":120`, `"completion_tokens":30`, `"cached_tokens":80`, `"reasoning_tokens":12`, `"cost_in_usd_ticks":9000`}},
-		{operation: OperationMessages, want: []string{`"input_tokens":40`, `"output_tokens":30`, `"cache_read_input_tokens":80`, `"cost_in_usd_ticks":9000`}},
+		{operation: OperationMessages, want: []string{`"input_tokens":40`, `"output_tokens":30`, `"cache_read_input_tokens":80`, `"thinking_tokens":12`, `"cost_in_usd_ticks":9000`}},
 	}
 	for _, test := range tests {
 		converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), test.operation))
@@ -934,5 +1236,52 @@ func TestConvertResponsesStreamMergesPartialUsageFrames(t *testing.T) {
 				t.Fatalf("%s partial usage lost %s:\n%s", test.operation, want, text)
 			}
 		}
+		if test.operation == OperationMessages {
+			assertAnthropicThinkingUsageEventPlacement(t, converted, 12)
+		}
+	}
+}
+
+func assertAnthropicThinkingUsageEventPlacement(t *testing.T, stream []byte, want int64) {
+	t.Helper()
+	seenStart := false
+	seenDelta := false
+	err := consumeSSE(bytes.NewReader(stream), func(event string, data []byte) error {
+		if event != "message_start" && event != "message_delta" {
+			return nil
+		}
+		var payload struct {
+			Message struct {
+				Usage map[string]json.RawMessage `json:"usage"`
+			} `json:"message"`
+			Usage map[string]json.RawMessage `json:"usage"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("decode %s event: %v", event, err)
+		}
+		if event == "message_start" {
+			seenStart = true
+			if _, exists := payload.Message.Usage["output_tokens_details"]; exists {
+				t.Fatalf("message_start unexpectedly contains output token details: %s", data)
+			}
+			return nil
+		}
+		seenDelta = true
+		var details struct {
+			ThinkingTokens int64 `json:"thinking_tokens"`
+		}
+		if err := json.Unmarshal(payload.Usage["output_tokens_details"], &details); err != nil {
+			t.Fatalf("decode message_delta output token details: %v", err)
+		}
+		if details.ThinkingTokens != want {
+			t.Fatalf("message_delta thinking_tokens = %d, want %d", details.ThinkingTokens, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seenStart || !seenDelta {
+		t.Fatalf("missing Anthropic usage events: message_start=%t message_delta=%t", seenStart, seenDelta)
 	}
 }

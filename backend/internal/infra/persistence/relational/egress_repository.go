@@ -37,9 +37,14 @@ func (r *EgressRepository) ListEgressNodes(ctx context.Context, scope egress.Sco
 	if err != nil {
 		return nil, err
 	}
+	profileNames, err := r.egressProxyProfileNames(ctx, rows)
+	if err != nil {
+		return nil, err
+	}
 	for _, row := range rows {
 		value := toEgressDomain(row)
 		value.AssignedAccountCount = counts[value.ID]
+		value.ProxyProfileName = profileNames[value.ProxyProfileID]
 		values = append(values, value)
 	}
 	return values, nil
@@ -93,10 +98,15 @@ func (r *EgressRepository) ListEgressNodePage(ctx context.Context, input reposit
 	if err != nil {
 		return nil, 0, err
 	}
+	profileNames, err := r.egressProxyProfileNames(ctx, rows)
+	if err != nil {
+		return nil, 0, err
+	}
 	values := make([]egress.Node, 0, len(rows))
 	for _, row := range rows {
 		value := toEgressDomain(row)
 		value.AssignedAccountCount = counts[value.ID]
+		value.ProxyProfileName = profileNames[value.ProxyProfileID]
 		values = append(values, value)
 	}
 	return values, total, nil
@@ -114,7 +124,13 @@ func (r *EgressRepository) GetEgressNode(ctx context.Context, id uint64) (egress
 
 func (r *EgressRepository) CreateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error) {
 	row := fromEgressDomain(value)
-	if err := r.db.db.WithContext(ctx).Create(&row).Error; err != nil {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := materializeEgressProxyProfile(tx, &row); err != nil {
+			return err
+		}
+		return tx.Create(&row).Error
+	})
+	if err != nil {
 		return egress.Node{}, mapError(err)
 	}
 	return toEgressDomain(row), nil
@@ -136,14 +152,44 @@ func (r *EgressRepository) CreateEgressNodes(ctx context.Context, values []egres
 
 func (r *EgressRepository) UpdateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error) {
 	row := fromEgressDomain(value)
-	result := r.db.db.WithContext(ctx).Save(&row)
-	if result.Error != nil {
-		return egress.Node{}, mapError(result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return egress.Node{}, repository.ErrNotFound
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := materializeEgressProxyProfile(tx, &row); err != nil {
+			return err
+		}
+		// Select("*").Updates keeps zero values while avoiding Save's fallback
+		// INSERT, which could resurrect a node deleted after the service read it.
+		result := tx.Model(&egressNodeModel{}).Where("id = ?", row.ID).Select("*").Updates(&row)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return repository.ErrNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return egress.Node{}, mapError(err)
 	}
 	return toEgressDomain(row), nil
+}
+
+// materializeEgressProxyProfile enforces the profile row as the canonical
+// source whenever a node is written. Locking the profile in the node write
+// transaction serializes this path with profile updates, preventing an older
+// application-layer snapshot from restoring stale encrypted proxy data.
+func materializeEgressProxyProfile(tx *gorm.DB, row *egressNodeModel) error {
+	if row.ProxyProfileID == nil || *row.ProxyProfileID == 0 {
+		return nil
+	}
+	var profile egressProxyProfileModel
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "encrypted_proxy_url").First(&profile, *row.ProxyProfileID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return repository.ErrEgressProxyProfileNotFound
+		}
+		return err
+	}
+	row.EncryptedProxyURL = profile.EncryptedProxyURL
+	return nil
 }
 
 func (r *EgressRepository) UpdateEgressNodesEnabled(ctx context.Context, ids []uint64, enabled bool) (int, error) {
@@ -221,20 +267,29 @@ func (r *EgressRepository) UpdateEgressNodeLastError(ctx context.Context, id uin
 	return nil
 }
 
-// UpdateEgressNodeProbe persists the result of a direct proxy probe without
-// affecting request health or Cloudflare clearance state.
+// UpdateEgressNodeProbe persists a direct proxy probe. A healthy result also
+// clears a transport-only request failure because the proxy has just been
+// verified independently; anti-bot and other request failures stay intact.
 func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64, expectedEncryptedProxyURL string, value egress.ProbeResult) error {
+	updates := map[string]any{
+		"probe_status": value.Status, "last_probed_at": value.TestedAt.UTC(),
+		"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "probe_error": value.Error, "probe_provider": storedProbeProvider(value.Provider),
+		"ipv4_probe_status": normalizedProbeStatus(value.IPv4.Status), "ipv4_last_probed_at": probeTestedAt(value.IPv4),
+		"ipv4_probe_latency_ms": value.IPv4.LatencyMS, "ipv4_exit_ip": value.IPv4.ExitIP, "ipv4_probe_error": value.IPv4.Error,
+		"ipv6_probe_status": normalizedProbeStatus(value.IPv6.Status), "ipv6_last_probed_at": probeTestedAt(value.IPv6),
+		"ipv6_probe_latency_ms": value.IPv6.LatencyMS, "ipv6_exit_ip": value.IPv6.ExitIP, "ipv6_probe_error": value.IPv6.Error,
+		"updated_at": time.Now().UTC(),
+	}
+	if value.Status == egress.ProbeStatusHealthy {
+		condition := "last_error = ?"
+		updates["health"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE health END", egress.LastErrorTransport, 1)
+		updates["failure_count"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE failure_count END", egress.LastErrorTransport, 0)
+		updates["cooldown_until"] = gorm.Expr("CASE WHEN "+condition+" THEN NULL ELSE cooldown_until END", egress.LastErrorTransport)
+		updates["last_error"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE last_error END", egress.LastErrorTransport, "")
+	}
 	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
 		Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).
-		Updates(map[string]any{
-			"probe_status": value.Status, "last_probed_at": value.TestedAt.UTC(),
-			"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "probe_error": value.Error, "probe_provider": storedProbeProvider(value.Provider),
-			"ipv4_probe_status": normalizedProbeStatus(value.IPv4.Status), "ipv4_last_probed_at": probeTestedAt(value.IPv4),
-			"ipv4_probe_latency_ms": value.IPv4.LatencyMS, "ipv4_exit_ip": value.IPv4.ExitIP, "ipv4_probe_error": value.IPv4.Error,
-			"ipv6_probe_status": normalizedProbeStatus(value.IPv6.Status), "ipv6_last_probed_at": probeTestedAt(value.IPv6),
-			"ipv6_probe_latency_ms": value.IPv6.LatencyMS, "ipv6_exit_ip": value.IPv6.ExitIP, "ipv6_probe_error": value.IPv6.Error,
-			"updated_at": time.Now().UTC(),
-		})
+		Updates(updates)
 	if result.Error != nil {
 		return mapError(result.Error)
 	}
@@ -281,6 +336,30 @@ func (r *EgressRepository) ListEgressSources(ctx context.Context) ([]egress.Subs
 		values = append(values, toEgressSubscriptionSourceDomain(row))
 	}
 	return values, nil
+}
+
+func (r *EgressRepository) ListEgressSourcePage(ctx context.Context, input repository.EgressSourceListQuery) ([]egress.SubscriptionSource, int64, error) {
+	query := r.db.db.WithContext(ctx).Model(&egressSubscriptionSourceModel{})
+	if search := strings.TrimSpace(input.Page.Search); search != "" {
+		query = query.Where("LOWER(egress_subscription_sources.name) LIKE ?", "%"+strings.ToLower(search)+"%")
+	}
+	if input.Filter.Scope != "" {
+		query = query.Where("egress_subscription_sources.scope = ?", input.Filter.Scope)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, mapError(err)
+	}
+	var rows []egressSubscriptionSourceModel
+	if err := query.Order("LOWER(egress_subscription_sources.name) ASC, egress_subscription_sources.id ASC").
+		Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+		return nil, 0, mapError(err)
+	}
+	values := make([]egress.SubscriptionSource, 0, len(rows))
+	for _, row := range rows {
+		values = append(values, toEgressSubscriptionSourceDomain(row))
+	}
+	return values, total, nil
 }
 
 func (r *EgressRepository) ListDueEgressSources(ctx context.Context, now time.Time, limit int) ([]egress.SubscriptionSource, error) {
@@ -435,9 +514,15 @@ func (r *EgressRepository) SaveEgressOperationsConfig(ctx context.Context, value
 	row := fromEgressOperationsConfigDomain(value)
 	row.ID = 1
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if _, err := lockEgressOperationsConfig(tx); err != nil {
+		locked, err := lockEgressOperationsConfig(tx)
+		if err != nil {
 			return err
 		}
+		// This schema-only marker is deliberately outside the domain settings.
+		// Preserve it across ordinary configuration updates so the legacy proxy
+		// migration cannot run again and overwrite an intentionally direct source.
+		row.SubscriptionProxyMigrationCompleted = locked.SubscriptionProxyMigrationCompleted
+		row.ProxyProfileMigrationCompleted = locked.ProxyProfileMigrationCompleted
 		if err := validateLockedEgressFallbackNodes(tx, row); err != nil {
 			return err
 		}
@@ -476,6 +561,7 @@ func configReferencesAnyFallbackNode(config egressOperationsConfigModel, ids []u
 		{config.WebFallbackMode, config.WebFallbackNodeID},
 		{config.ConsoleFallbackMode, config.ConsoleFallbackNodeID},
 		{config.WebAssetFallbackMode, config.WebAssetFallbackNodeID},
+		{config.ConsoleAssetFallbackMode, config.ConsoleAssetFallbackNodeID},
 	} {
 		if egress.FallbackMode(fallback.mode).Normalized() != egress.FallbackModeFixed {
 			continue
@@ -497,6 +583,7 @@ func validateLockedEgressFallbackNodes(tx *gorm.DB, config egressOperationsConfi
 		{egress.ScopeWeb, config.WebFallbackMode, config.WebFallbackNodeID},
 		{egress.ScopeConsole, config.ConsoleFallbackMode, config.ConsoleFallbackNodeID},
 		{egress.ScopeWebAsset, config.WebAssetFallbackMode, config.WebAssetFallbackNodeID},
+		{egress.ScopeConsoleAsset, config.ConsoleAssetFallbackMode, config.ConsoleAssetFallbackNodeID},
 	}
 	ids := make([]uint64, 0, len(fallbacks))
 	for _, fallback := range fallbacks {
@@ -634,6 +721,7 @@ func clearEgressFallbackNodeReferences(tx *gorm.DB, ids []uint64) error {
 		{"web_fallback_mode", "web_fallback_node_id"},
 		{"console_fallback_mode", "console_fallback_node_id"},
 		{"web_asset_fallback_mode", "web_asset_fallback_node_id"},
+		{"console_asset_fallback_mode", "console_asset_fallback_node_id"},
 	} {
 		if err := tx.Model(&egressOperationsConfigModel{}).
 			Where("id = ? AND "+columns[1]+" IN ?", 1, ids).
@@ -662,6 +750,7 @@ func clearInvalidEgressFallbackNodeReferences(tx *gorm.DB) error {
 		{egress.ScopeWeb, config.WebFallbackMode, config.WebFallbackNodeID, "web_fallback_mode", "web_fallback_node_id"},
 		{egress.ScopeConsole, config.ConsoleFallbackMode, config.ConsoleFallbackNodeID, "console_fallback_mode", "console_fallback_node_id"},
 		{egress.ScopeWebAsset, config.WebAssetFallbackMode, config.WebAssetFallbackNodeID, "web_asset_fallback_mode", "web_asset_fallback_node_id"},
+		{egress.ScopeConsoleAsset, config.ConsoleAssetFallbackMode, config.ConsoleAssetFallbackNodeID, "console_asset_fallback_mode", "console_asset_fallback_node_id"},
 	} {
 		if egress.FallbackMode(fallback.mode).Normalized() != egress.FallbackModeFixed {
 			continue
@@ -685,6 +774,38 @@ func clearInvalidEgressFallbackNodeReferences(tx *gorm.DB) error {
 
 func (r *EgressRepository) assignedAccountCounts(ctx context.Context) (map[uint64]int, error) {
 	return r.assignedAccountCountsForNodes(ctx, nil)
+}
+
+func (r *EgressRepository) egressProxyProfileNames(ctx context.Context, nodes []egressNodeModel) (map[uint64]string, error) {
+	ids := make([]uint64, 0)
+	seen := make(map[uint64]struct{})
+	for _, node := range nodes {
+		id := valueEgressNodeID(node.ProxyProfileID)
+		if id == 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return map[uint64]string{}, nil
+	}
+	type row struct {
+		ID   uint64
+		Name string
+	}
+	var rows []row
+	if err := r.db.db.WithContext(ctx).Model(&egressProxyProfileModel{}).Select("id", "name").Where("id IN ?", ids).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[uint64]string, len(rows))
+	for _, row := range rows {
+		result[row.ID] = row.Name
+	}
+	return result, nil
 }
 
 func (r *EgressRepository) assignedAccountCountsForNodes(ctx context.Context, nodeIDs []uint64) (map[uint64]int, error) {
@@ -716,6 +837,7 @@ func toEgressDomain(row egressNodeModel) egress.Node {
 	return egress.Node{
 		ID: row.ID, Name: row.Name, Scope: egress.Scope(row.Scope), Enabled: row.Enabled, ProxyPool: row.ProxyPool,
 		SourceID: valueEgressNodeID(row.SourceID), SourceKey: row.SourceKey, AccountCapacity: row.AccountCapacity,
+		ProxyProfileID:    valueEgressNodeID(row.ProxyProfileID),
 		EncryptedProxyURL: row.EncryptedProxyURL, UserAgent: row.UserAgent, EncryptedCloudflareCookie: row.EncryptedCloudflareCookie,
 		ClearanceRefreshedAt: row.ClearanceRefreshedAt, ClearanceFingerprint: row.ClearanceFingerprint,
 		ClearanceBindingFingerprint: row.ClearanceBindingFingerprint,
@@ -740,6 +862,7 @@ func fromEgressDomain(value egress.Node) egressNodeModel {
 	return egressNodeModel{
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, ProxyPool: value.ProxyPool,
 		SourceID: egressNodeID(value.SourceID), SourceKey: value.SourceKey, AccountCapacity: value.AccountCapacity,
+		ProxyProfileID:    egressNodeID(value.ProxyProfileID),
 		EncryptedProxyURL: value.EncryptedProxyURL, UserAgent: value.UserAgent, EncryptedCloudflareCookie: value.EncryptedCloudflareCookie,
 		ClearanceRefreshedAt: value.ClearanceRefreshedAt, ClearanceFingerprint: value.ClearanceFingerprint,
 		ClearanceBindingFingerprint: value.ClearanceBindingFingerprint,
@@ -786,7 +909,7 @@ func probeFamilyFromRow(status string, testedAt *time.Time, latencyMS int, exitI
 
 func toEgressSubscriptionSourceDomain(row egressSubscriptionSourceModel) egress.SubscriptionSource {
 	return egress.SubscriptionSource{
-		ID: row.ID, Name: row.Name, Scope: egress.Scope(row.Scope), Enabled: row.Enabled, EncryptedURL: row.EncryptedURL,
+		ID: row.ID, Name: row.Name, Scope: egress.Scope(row.Scope), Enabled: row.Enabled, EncryptedURL: row.EncryptedURL, EncryptedProxyURL: row.EncryptedProxyURL,
 		RefreshIntervalSeconds: row.RefreshIntervalSeconds, DefaultAccountCapacity: row.DefaultAccountCapacity,
 		LastSyncedAt: row.LastSyncedAt, NextSyncAt: row.NextSyncAt, LastSyncImported: row.LastSyncImported, LastSyncError: row.LastSyncError,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
@@ -795,7 +918,7 @@ func toEgressSubscriptionSourceDomain(row egressSubscriptionSourceModel) egress.
 
 func fromEgressSubscriptionSourceDomain(value egress.SubscriptionSource) egressSubscriptionSourceModel {
 	return egressSubscriptionSourceModel{
-		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, EncryptedURL: value.EncryptedURL,
+		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, EncryptedURL: value.EncryptedURL, EncryptedProxyURL: value.EncryptedProxyURL,
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 		LastSyncedAt: value.LastSyncedAt, NextSyncAt: value.NextSyncAt, LastSyncImported: value.LastSyncImported, LastSyncError: value.LastSyncError,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -808,10 +931,11 @@ func toEgressOperationsConfigDomain(row egressOperationsConfigModel) egress.Oper
 		ProbeIntervalSeconds: row.ProbeIntervalSeconds, AutoAssignEnabled: row.AutoAssignEnabled, AutoBalanceEnabled: row.AutoBalanceEnabled,
 		AssignmentIntervalSeconds: row.AssignmentIntervalSeconds,
 		Fallbacks: map[egress.Scope]egress.FallbackConfig{
-			egress.ScopeBuild:    {Mode: egress.FallbackMode(row.BuildFallbackMode).Normalized(), NodeID: row.BuildFallbackNodeID},
-			egress.ScopeWeb:      {Mode: egress.FallbackMode(row.WebFallbackMode).Normalized(), NodeID: row.WebFallbackNodeID},
-			egress.ScopeConsole:  {Mode: egress.FallbackMode(row.ConsoleFallbackMode).Normalized(), NodeID: row.ConsoleFallbackNodeID},
-			egress.ScopeWebAsset: {Mode: egress.FallbackMode(row.WebAssetFallbackMode).Normalized(), NodeID: row.WebAssetFallbackNodeID},
+			egress.ScopeBuild:        {Mode: egress.FallbackMode(row.BuildFallbackMode).Normalized(), NodeID: row.BuildFallbackNodeID},
+			egress.ScopeWeb:          {Mode: egress.FallbackMode(row.WebFallbackMode).Normalized(), NodeID: row.WebFallbackNodeID},
+			egress.ScopeConsole:      {Mode: egress.FallbackMode(row.ConsoleFallbackMode).Normalized(), NodeID: row.ConsoleFallbackNodeID},
+			egress.ScopeWebAsset:     {Mode: egress.FallbackMode(row.WebAssetFallbackMode).Normalized(), NodeID: row.WebAssetFallbackNodeID},
+			egress.ScopeConsoleAsset: {Mode: egress.FallbackMode(row.ConsoleAssetFallbackMode).Normalized(), NodeID: row.ConsoleAssetFallbackNodeID},
 		},
 		UpdatedAt: row.UpdatedAt,
 	}
@@ -822,6 +946,7 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 	webFallback := value.FallbackFor(egress.ScopeWeb)
 	consoleFallback := value.FallbackFor(egress.ScopeConsole)
 	webAssetFallback := value.FallbackFor(egress.ScopeWebAsset)
+	consoleAssetFallback := value.FallbackFor(egress.ScopeConsoleAsset)
 	return egressOperationsConfigModel{
 		ID: 1, ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
@@ -829,6 +954,7 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 		WebFallbackMode: string(webFallback.Mode), WebFallbackNodeID: webFallback.NodeID,
 		ConsoleFallbackMode: string(consoleFallback.Mode), ConsoleFallbackNodeID: consoleFallback.NodeID,
 		WebAssetFallbackMode: string(webAssetFallback.Mode), WebAssetFallbackNodeID: webAssetFallback.NodeID,
+		ConsoleAssetFallbackMode: string(consoleAssetFallback.Mode), ConsoleAssetFallbackNodeID: consoleAssetFallback.NodeID,
 		UpdatedAt: value.UpdatedAt,
 	}
 }

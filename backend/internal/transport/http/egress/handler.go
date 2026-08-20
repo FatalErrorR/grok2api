@@ -1,11 +1,18 @@
 package egress
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
@@ -16,11 +23,40 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Handler struct{ service *egressapp.Service }
+type Handler struct {
+	service         *egressapp.Service
+	guardStatePath  string
+	guardConfigPath string
+	guardProbe      egressapp.QualityProbeInput
+	profilesMu      sync.Mutex
+}
 
-func NewHandler(service *egressapp.Service) *Handler { return &Handler{service: service} }
+func NewHandler(service *egressapp.Service, guardStatePath ...string) *Handler {
+	path := ""
+	if len(guardStatePath) > 0 {
+		path = strings.TrimSpace(guardStatePath[0])
+	}
+	configPath := ""
+	if len(guardStatePath) > 1 {
+		configPath = strings.TrimSpace(guardStatePath[1])
+	}
+	return &Handler{service: service, guardStatePath: path, guardConfigPath: configPath}
+}
+
+// WithQualityGuardProbe pins the sidecar probe to server-owned credentials and
+// payload. The internal caller can select only the physical egress node.
+func (h *Handler) WithQualityGuardProbe(input egressapp.QualityProbeInput) *Handler {
+	h.guardProbe = input
+	return h
+}
 
 func (h *Handler) Register(router *gin.RouterGroup) {
+	router.GET("/egress-proxy-profiles", h.listProxyProfiles)
+	router.GET("/egress-proxy-profiles/:id", h.getProxyProfile)
+	router.POST("/egress-proxy-profiles", h.createProxyProfile)
+	router.PUT("/egress-proxy-profiles/:id", h.updateProxyProfile)
+	router.DELETE("/egress-proxy-profiles/:id", h.deleteProxyProfile)
+	router.POST("/egress-proxy-profiles/:id/proxy-url/reveal", h.proxyProfileURL)
 	router.GET("/egress-nodes", h.list)
 	router.POST("/egress-nodes", h.create)
 	router.PATCH("/egress-nodes/batch", h.updateMany)
@@ -29,6 +65,15 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/egress-nodes/cleanup", h.cleanup)
 	router.POST("/egress-nodes/test", h.testNodes)
 	router.POST("/egress-nodes/:id/test", h.testNode)
+	router.POST("/egress-nodes/:id/proxy-url/reveal", h.proxyURL)
+	router.POST("/egress-nodes/:id/quality-test", h.testQuality)
+	router.GET("/egress-quality-guard", h.qualityGuardStatus)
+	router.PUT("/egress-quality-guard/config", h.updateQualityGuardConfig)
+	router.GET("/egress-quality-guard/profiles", h.listQualityGuardProfiles)
+	router.POST("/egress-quality-guard/profiles", h.createQualityGuardProfile)
+	router.PUT("/egress-quality-guard/profiles/:id", h.updateQualityGuardProfile)
+	router.DELETE("/egress-quality-guard/profiles/:id", h.deleteQualityGuardProfile)
+	router.POST("/egress-quality-guard/nodes/:id/test", h.testQualityGuardNode)
 	router.POST("/egress-nodes/:id/accounts", h.assignAccounts)
 	router.DELETE("/egress-nodes/accounts", h.unassignAccounts)
 	router.PUT("/egress-nodes/:id", h.update)
@@ -43,6 +88,491 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-operations", h.operationsConfig)
 	router.PUT("/egress-operations", h.updateOperationsConfig)
 	router.POST("/egress-operations/rebalance", h.rebalance)
+}
+
+// RegisterQualityGuard exposes the minimum egress surface required by the
+// sidecar. Destructive node, source, binding, and credential operations remain
+// available only through administrator authentication.
+func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
+	router.GET("/egress-nodes", h.list)
+	router.PATCH("/egress-nodes/batch", h.updateMany)
+	router.POST("/egress-nodes/:id/test", h.testNode)
+	router.POST("/egress-nodes/:id/quality-test", h.testQualityGuardNode)
+	router.GET("/egress-leases", h.listQualityGuardLeases)
+	router.POST("/egress-leases/quarantine", h.quarantineQualityGuardLease)
+	router.POST("/egress-leases/restore", h.restoreQualityGuardLease)
+	router.GET("/egress-operations", h.operationsConfig)
+}
+
+// A fully populated 2,000-node guard state is slightly larger than 1 MiB.
+// Keep a bounded limit while leaving headroom for audit cursors and events.
+const maxQualityGuardStateBytes = 8 << 20
+
+type qualityGuardState struct {
+	Version           int                              `json:"version"`
+	StartedAt         float64                          `json:"started_at"`
+	UpdatedAt         float64                          `json:"updated_at"`
+	LastActiveCycleAt float64                          `json:"last_active_cycle_at"`
+	LastPassivePollAt float64                          `json:"last_passive_poll_at"`
+	Guard             qualityGuardConfig               `json:"guard"`
+	ProtectedNodeIDs  []string                         `json:"protected_node_ids"`
+	Nodes             map[string]qualityGuardNodeState `json:"nodes"`
+	RecentEvents      []qualityGuardEvent              `json:"recent_events"`
+	Statistics        qualityGuardStatistics           `json:"statistics"`
+}
+
+type qualityGuardStatistics struct {
+	StartedAt float64                    `json:"started_at"`
+	Active    qualityGuardDetectionStats `json:"active"`
+	Passive   qualityGuardDetectionStats `json:"passive"`
+	Actions   qualityGuardActionStats    `json:"actions"`
+}
+
+type qualityGuardDetectionStats struct {
+	Total        uint64 `json:"total"`
+	Healthy      uint64 `json:"healthy"`
+	Soft         uint64 `json:"soft"`
+	Hard         uint64 `json:"hard"`
+	Errors       uint64 `json:"errors"`
+	OutputTokens uint64 `json:"output_tokens"`
+}
+
+type qualityGuardActionStats struct {
+	Quarantined uint64 `json:"quarantined"`
+	Restored    uint64 `json:"restored"`
+	Suppressed  uint64 `json:"suppressed"`
+}
+
+type qualityGuardConfig struct {
+	Mode                  string   `json:"mode"`
+	Model                 string   `json:"model"`
+	NodeIDs               []string `json:"node_ids"`
+	ActiveIntervalSeconds int      `json:"active_interval_seconds"`
+	PassivePollSeconds    int      `json:"passive_poll_seconds"`
+	SoftTPS               float64  `json:"soft_tps"`
+	HardTPS               float64  `json:"hard_tps"`
+	ConsecutiveSoft       int      `json:"consecutive_soft"`
+	ConsecutiveErrors     int      `json:"consecutive_errors"`
+	QuarantineSeconds     int      `json:"quarantine_seconds"`
+	MinHealthyNodes       int      `json:"min_healthy_nodes"`
+	MaxOutputTokens       int      `json:"max_output_tokens"`
+	FailClosed            bool     `json:"fail_closed"`
+	MinGenerationMS       int      `json:"min_generation_ms"`
+	Prompt                string   `json:"prompt"`
+	Expected              string   `json:"expected"`
+}
+
+type qualityGuardNodeState struct {
+	ObserveOnly        bool    `json:"observe_only"`
+	ObserveOnlyReason  string  `json:"observe_only_reason"`
+	QuarantinedLeases  int     `json:"quarantined_lease_count"`
+	ActiveSoftStrikes  int     `json:"active_soft_strikes"`
+	PassiveSoftStrikes int     `json:"passive_soft_strikes"`
+	ErrorStrikes       int     `json:"error_strikes"`
+	QuarantinedUntil   float64 `json:"quarantined_until"`
+	DisabledByGuard    bool    `json:"disabled_by_guard"`
+	LastReason         string  `json:"last_reason"`
+	LastProbeAt        float64 `json:"last_probe_at"`
+	LastObservedAt     float64 `json:"last_observed_at"`
+	LastSource         string  `json:"last_source"`
+	LastClassification string  `json:"last_classification"`
+	LastOutputTPS      float64 `json:"last_output_tps"`
+	LastOutputTokens   int     `json:"last_output_tokens"`
+	LastFirstTokenMS   int     `json:"last_first_token_ms"`
+	LastDurationMS     int     `json:"last_duration_ms"`
+}
+
+type qualityGuardEvent struct {
+	TS             float64 `json:"ts"`
+	Event          string  `json:"event"`
+	NodeID         string  `json:"node_id"`
+	NodeName       string  `json:"node_name"`
+	AccountID      string  `json:"account_id,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
+	Reason         string  `json:"reason"`
+	Classification string  `json:"classification"`
+	OutputTPS      float64 `json:"output_tps"`
+	CooldownUntil  float64 `json:"cooldown_until,omitempty"`
+}
+
+func (h *Handler) qualityGuardStatus(c *gin.Context) {
+	state, available, err := h.readQualityGuardState()
+	if !available {
+		response.Success(c, http.StatusOK, gin.H{"available": false})
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护状态暂不可用")
+		return
+	}
+	payload := gin.H{
+		"available":         true,
+		"editable":          h.guardConfigPath != "",
+		"startedAt":         state.StartedAt,
+		"updatedAt":         state.UpdatedAt,
+		"lastActiveCycleAt": state.LastActiveCycleAt,
+		"lastPassivePollAt": state.LastPassivePollAt,
+		"config": gin.H{
+			"mode": state.Guard.Mode, "model": state.Guard.Model,
+			"node_ids": state.Guard.NodeIDs, "active_interval_seconds": state.Guard.ActiveIntervalSeconds,
+			"passive_poll_seconds": state.Guard.PassivePollSeconds, "soft_tps": state.Guard.SoftTPS,
+			"hard_tps": state.Guard.HardTPS, "consecutive_soft": state.Guard.ConsecutiveSoft,
+			"consecutive_errors": state.Guard.ConsecutiveErrors, "quarantine_seconds": state.Guard.QuarantineSeconds,
+			"min_healthy_nodes": state.Guard.MinHealthyNodes, "max_output_tokens": state.Guard.MaxOutputTokens,
+			"fail_closed": state.Guard.FailClosed, "min_generation_ms": state.Guard.MinGenerationMS,
+		},
+		"nodes": state.Nodes, "protectedNodeIds": state.ProtectedNodeIDs, "recentEvents": state.RecentEvents,
+	}
+	if state.Statistics.StartedAt > 0 {
+		payload["statistics"] = state.Statistics
+	}
+	if profiles, err := loadProbeProfileFile(h.profilesPath()); err == nil {
+		payload["activeProfileId"] = profiles.ActiveProfileID
+		payload["profiles"] = profiles.summaries()
+	}
+	response.Success(c, http.StatusOK, payload)
+}
+
+type qualityGuardConfigRequest struct {
+	Mode                  string  `json:"mode"`
+	ActiveIntervalSeconds int     `json:"activeIntervalSeconds"`
+	PassivePollSeconds    int     `json:"passivePollSeconds"`
+	SoftTPS               float64 `json:"softTPS"`
+	HardTPS               float64 `json:"hardTPS"`
+	ConsecutiveSoft       int     `json:"consecutiveSoft"`
+	ConsecutiveErrors     int     `json:"consecutiveErrors"`
+	QuarantineSeconds     int     `json:"quarantineSeconds"`
+	MinHealthyNodes       int     `json:"minHealthyNodes"`
+}
+
+type qualityGuardRuntimeConfigFile struct {
+	Version  int                               `json:"version"`
+	Settings qualityGuardRuntimeConfigSettings `json:"settings"`
+}
+
+type qualityGuardRuntimeConfigSettings struct {
+	Mode                  string  `json:"mode"`
+	ActiveIntervalSeconds int     `json:"active_interval_seconds"`
+	PassivePollSeconds    int     `json:"passive_poll_seconds"`
+	SoftTPS               float64 `json:"soft_tps"`
+	HardTPS               float64 `json:"hard_tps"`
+	ConsecutiveSoft       int     `json:"consecutive_soft"`
+	ConsecutiveErrors     int     `json:"consecutive_errors"`
+	QuarantineSeconds     int     `json:"quarantine_seconds"`
+	MinHealthyNodes       int     `json:"min_healthy_nodes"`
+}
+
+func (h *Handler) updateQualityGuardConfig(c *gin.Context) {
+	if h.guardConfigPath == "" {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardReadOnly", "质量守护策略当前只读")
+		return
+	}
+	state, available, err := h.readQualityGuardState()
+	if err != nil || !available {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护状态暂不可用")
+		return
+	}
+	var request qualityGuardConfigRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if err := request.validate(len(state.Guard.NodeIDs)); err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidQualityGuardConfig", err.Error())
+		return
+	}
+	value := qualityGuardRuntimeConfigFile{Version: 1, Settings: qualityGuardRuntimeConfigSettings{
+		Mode: request.Mode, ActiveIntervalSeconds: request.ActiveIntervalSeconds,
+		PassivePollSeconds: request.PassivePollSeconds, SoftTPS: request.SoftTPS, HardTPS: request.HardTPS,
+		ConsecutiveSoft: request.ConsecutiveSoft, ConsecutiveErrors: request.ConsecutiveErrors,
+		QuarantineSeconds: request.QuarantineSeconds, MinHealthyNodes: request.MinHealthyNodes,
+	}}
+	if err := saveQualityGuardRuntimeConfig(h.guardConfigPath, value); err != nil {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardConfigWriteFailed", "质量守护策略保存失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"saved": true})
+}
+
+func (r qualityGuardConfigRequest) validate(nodeCount int) error {
+	if r.Mode != "active" && r.Mode != "passive" && r.Mode != "hybrid" {
+		return errors.New("检测模式无效")
+	}
+	if r.ActiveIntervalSeconds < 60 || r.ActiveIntervalSeconds > 86400 {
+		return errors.New("主动检测间隔必须在 60 到 86400 秒之间")
+	}
+	if r.PassivePollSeconds < 1 || r.PassivePollSeconds > 300 {
+		return errors.New("被动审计间隔必须在 1 到 300 秒之间")
+	}
+	if math.IsNaN(r.SoftTPS) || math.IsInf(r.SoftTPS, 0) || math.IsNaN(r.HardTPS) || math.IsInf(r.HardTPS, 0) || r.SoftTPS < 1 || r.HardTPS > 10000 || r.SoftTPS >= r.HardTPS {
+		return errors.New("Token/s 阈值无效，软阈值必须低于硬阈值")
+	}
+	if r.ConsecutiveSoft < 1 || r.ConsecutiveSoft > 20 || r.ConsecutiveErrors < 1 || r.ConsecutiveErrors > 20 {
+		return errors.New("连续命中次数必须在 1 到 20 之间")
+	}
+	if r.QuarantineSeconds < 30 || r.QuarantineSeconds > 86400 {
+		return errors.New("隔离时长必须在 30 到 86400 秒之间")
+	}
+	if r.MinHealthyNodes < 1 || r.MinHealthyNodes > nodeCount {
+		return errors.New("最少保留节点必须在受管节点数量范围内")
+	}
+	return nil
+}
+
+func saveQualityGuardRuntimeConfig(path string, value qualityGuardRuntimeConfigFile) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".runtime-config-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+func (h *Handler) readQualityGuardState() (qualityGuardState, bool, error) {
+	if h.guardStatePath == "" {
+		return qualityGuardState{}, false, nil
+	}
+	file, err := os.Open(h.guardStatePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return qualityGuardState{}, false, nil
+		}
+		return qualityGuardState{}, true, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxQualityGuardStateBytes+1))
+	if err != nil || len(data) > maxQualityGuardStateBytes {
+		return qualityGuardState{}, true, errors.New("质量守护状态不可读")
+	}
+	var state qualityGuardState
+	if json.Unmarshal(data, &state) != nil || state.Version != 1 || state.Guard.Mode == "" || state.Nodes == nil {
+		return qualityGuardState{}, true, errors.New("质量守护状态格式无效")
+	}
+	if state.RecentEvents == nil {
+		state.RecentEvents = []qualityGuardEvent{}
+	}
+	if state.ProtectedNodeIDs == nil {
+		state.ProtectedNodeIDs = []string{}
+	}
+	return state, true, nil
+}
+
+func (h *Handler) testQualityGuardNode(c *gin.Context) {
+	nodeID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if h.guardProbe.ClientKeyID == 0 || strings.TrimSpace(h.guardProbe.Model) == "" {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
+		return
+	}
+	var request struct {
+		ProfileID string `json:"profileId"`
+		AccountID string `json:"accountId"`
+	}
+	_ = c.ShouldBindJSON(&request)
+	input, err := h.resolveProbeInput(strings.TrimSpace(request.ProfileID))
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+		return
+	}
+	if strings.TrimSpace(input.Prompt) == "" {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
+		return
+	}
+	if strings.TrimSpace(request.AccountID) != "" {
+		accountID, parseErr := strconv.ParseUint(request.AccountID, 10, 64)
+		if parseErr != nil || accountID == 0 {
+			response.Error(c, http.StatusBadRequest, "invalidAccountId", "账号 ID 无效")
+			return
+		}
+		input.AccountID = accountID
+	}
+	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, input)
+	if err != nil {
+		h.writeQualityProbeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
+		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
+		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
+		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
+		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
+		"outputTokensPerSecond":  value.OutputTokensPerSecond,
+		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"thinkingRequired": value.ThinkingRequired,
+		"responseSha256":   value.ResponseSHA256,
+	})
+}
+
+type qualityLeaseRequest struct {
+	AccountID         string `json:"accountId" binding:"required"`
+	NodeID            string `json:"nodeId" binding:"required"`
+	Reason            string `json:"reason"`
+	Version           string `json:"version"`
+	QuarantineSeconds int    `json:"quarantineSeconds"`
+}
+
+type qualityLeaseCursor struct {
+	CooldownUntil int64  `json:"t"`
+	AccountID     uint64 `json:"a"`
+	NodeID        uint64 `json:"n"`
+}
+
+func qualityLeaseResponse(value accountdomain.EgressLeaseBlock) gin.H {
+	return gin.H{
+		"accountId": strconv.FormatUint(value.AccountID, 10), "nodeId": strconv.FormatUint(value.NodeID, 10),
+		"reason": value.Reason, "version": value.Version, "cooldownUntil": float64(value.CooldownUntil.UnixMilli()) / 1000,
+		"updatedAt": value.UpdatedAt.UTC(),
+	}
+}
+
+func (h *Handler) listQualityGuardLeases(c *gin.Context) {
+	limit, parseErr := strconv.Atoi(c.DefaultQuery("limit", "500"))
+	if parseErr != nil || limit < 1 || limit > 1000 {
+		response.Error(c, http.StatusBadRequest, "invalidPageSize", "分页大小无效")
+		return
+	}
+	cursor, cursorErr := decodeQualityLeaseCursor(c.Query("cursor"))
+	if cursorErr != nil {
+		response.Error(c, http.StatusBadRequest, "invalidCursor", "分页游标无效")
+		return
+	}
+	values, err := h.service.ListQualityLeases(c.Request.Context(), limit+1, cursor)
+	if err != nil {
+		h.writeQualityLeaseError(c, err)
+		return
+	}
+	hasMore := len(values) > limit
+	if hasMore {
+		values = values[:limit]
+	}
+	items := make([]gin.H, 0, len(values))
+	for _, value := range values {
+		items = append(items, qualityLeaseResponse(value))
+	}
+	nextCursor := ""
+	if hasMore && len(values) > 0 {
+		nextCursor = encodeQualityLeaseCursor(values[len(values)-1])
+	}
+	response.Success(c, http.StatusOK, gin.H{"items": items, "hasMore": hasMore, "nextCursor": nextCursor})
+}
+
+func decodeQualityLeaseCursor(raw string) (*accountdomain.EgressLeaseBlockCursor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) > 256 {
+		return nil, errors.New("cursor too long")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var value qualityLeaseCursor
+	decoder := json.NewDecoder(strings.NewReader(string(decoded)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil || value.CooldownUntil <= 0 || value.AccountID == 0 || value.NodeID == 0 {
+		return nil, errors.New("invalid cursor")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid cursor")
+	}
+	return &accountdomain.EgressLeaseBlockCursor{
+		CooldownUntil: time.Unix(0, value.CooldownUntil).UTC(), AccountID: value.AccountID, NodeID: value.NodeID,
+	}, nil
+}
+
+func encodeQualityLeaseCursor(value accountdomain.EgressLeaseBlock) string {
+	payload, _ := json.Marshal(qualityLeaseCursor{
+		CooldownUntil: value.CooldownUntil.UTC().UnixNano(), AccountID: value.AccountID, NodeID: value.NodeID,
+	})
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func (h *Handler) quarantineQualityGuardLease(c *gin.Context) {
+	var request qualityLeaseRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	accountID, accountErr := strconv.ParseUint(request.AccountID, 10, 64)
+	nodeID, nodeErr := strconv.ParseUint(request.NodeID, 10, 64)
+	if accountErr != nil || nodeErr != nil || accountID == 0 || nodeID == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "账号或节点 ID 无效")
+		return
+	}
+	value, err := h.service.QuarantineQualityLease(c.Request.Context(), egressapp.QualityLeaseInput{
+		AccountID: accountID, NodeID: nodeID, Reason: request.Reason, QuarantineSeconds: request.QuarantineSeconds,
+	})
+	if err != nil {
+		h.writeQualityLeaseError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, qualityLeaseResponse(value))
+}
+
+func (h *Handler) restoreQualityGuardLease(c *gin.Context) {
+	var request qualityLeaseRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	accountID, accountErr := strconv.ParseUint(request.AccountID, 10, 64)
+	nodeID, nodeErr := strconv.ParseUint(request.NodeID, 10, 64)
+	if accountErr != nil || nodeErr != nil || accountID == 0 || nodeID == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "账号或节点 ID 无效")
+		return
+	}
+	restored, err := h.service.RestoreQualityLease(c.Request.Context(), accountID, nodeID, request.Version)
+	if err != nil {
+		h.writeQualityLeaseError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"restored": restored})
+}
+
+func (h *Handler) writeQualityLeaseError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, egressapp.ErrInvalidInput):
+		response.Error(c, http.StatusBadRequest, "invalidQualityLease", "租约隔离参数无效")
+	case errors.Is(err, egressapp.ErrNotFound):
+		response.Error(c, http.StatusNotFound, "egressNodeNotFound", "代理节点不存在")
+	case errors.Is(err, egressapp.ErrQualityLeaseConflict):
+		response.Error(c, http.StatusConflict, "qualityLeaseConflict", "租约绑定或隔离版本已变化")
+	case errors.Is(err, egressapp.ErrQualityLeaseUnavailable):
+		response.Error(c, http.StatusServiceUnavailable, "qualityLeaseUnavailable", "租约级质量隔离暂不可用")
+	default:
+		response.Error(c, http.StatusInternalServerError, "qualityLeaseOperationFailed", "租约级质量隔离操作失败")
+	}
 }
 
 func (h *Handler) cleanupPreview(c *gin.Context) {
@@ -84,6 +614,7 @@ type nodeRequest struct {
 	ProxyPool         *bool   `json:"proxyPool"`
 	AccountCapacity   *int    `json:"accountCapacity"`
 	ProxyURL          *string `json:"proxyURL"`
+	ProxyProfileID    *uint64 `json:"proxyProfileId,string"`
 	ClearProxyURL     bool    `json:"clearProxyURL"`
 	UserAgent         string  `json:"userAgent"`
 	CloudflareCookies *string `json:"cloudflareCookies"`
@@ -96,8 +627,12 @@ type nodeResponse struct {
 	Scope                string              `json:"scope"`
 	Enabled              bool                `json:"enabled"`
 	ProxyConfigured      bool                `json:"proxyConfigured"`
+	ProxyDisplay         string              `json:"proxyDisplay,omitempty"`
+	ProxyFingerprint     string              `json:"proxyFingerprint,omitempty"`
 	ProxyPool            bool                `json:"proxyPool"`
 	SourceID             uint64              `json:"sourceId,omitempty,string"`
+	ProxyProfileID       uint64              `json:"proxyProfileId,omitempty,string"`
+	ProxyProfileName     string              `json:"proxyProfileName,omitempty"`
 	AccountCapacity      int                 `json:"accountCapacity"`
 	UserAgent            string              `json:"userAgent"`
 	CookieConfigured     bool                `json:"cookieConfigured"`
@@ -138,6 +673,50 @@ type batchNodeDeleteRequest struct {
 type batchNodeUpdateRequest struct {
 	IDs     []string `json:"ids" binding:"required"`
 	Enabled *bool    `json:"enabled" binding:"required"`
+}
+
+type qualityProbeRequest struct {
+	ClientKeyID     string `json:"clientKeyId" binding:"required"`
+	Model           string `json:"model" binding:"required"`
+	Prompt          string `json:"prompt"`
+	Expected        string `json:"expected"`
+	MaxOutputTokens int    `json:"maxOutputTokens"`
+}
+
+func (h *Handler) testQuality(c *gin.Context) {
+	nodeID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request qualityProbeRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	clientKeyID, err := strconv.ParseUint(request.ClientKeyID, 10, 64)
+	if err != nil || clientKeyID == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidClientKeyId", "Client Key ID 无效")
+		return
+	}
+	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, egressapp.QualityProbeInput{
+		ClientKeyID: clientKeyID, Model: request.Model, Prompt: request.Prompt,
+		Expected: request.Expected, MaxOutputTokens: request.MaxOutputTokens,
+	})
+	if err != nil {
+		h.writeQualityProbeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
+		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
+		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
+		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
+		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
+		"outputTokensPerSecond":  value.OutputTokensPerSecond,
+		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"thinkingRequired": value.ThinkingRequired,
+		"responseSha256":   value.ResponseSHA256,
+	})
 }
 
 func (h *Handler) updateMany(c *gin.Context) {
@@ -228,7 +807,8 @@ func (value nodeRequest) input() egressapp.Input {
 	return egressapp.Input{
 		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled, ProxyPool: value.ProxyPool,
 		AccountCapacity: value.AccountCapacity,
-		ProxyURL:        value.ProxyURL, ClearProxyURL: value.ClearProxyURL, UserAgent: value.UserAgent,
+		ProxyURL:        value.ProxyURL, ProxyProfileID: value.ProxyProfileID,
+		ClearProxyURL: value.ClearProxyURL, UserAgent: value.UserAgent,
 		CloudflareCookies: value.CloudflareCookies, ClearCookies: value.ClearCookies,
 	}
 }
@@ -329,12 +909,137 @@ func (h *Handler) update(c *gin.Context) {
 	response.Success(c, http.StatusOK, newNodeResponse(value))
 }
 
+func (h *Handler) proxyURL(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Pragma", "no-cache")
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	value, err := h.service.ProxyURL(c.Request.Context(), id)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"proxyURL": value})
+}
+
+type proxyProfileRequest struct {
+	Name     string  `json:"name"`
+	ProxyURL *string `json:"proxyURL"`
+}
+
+type proxyProfileResponse struct {
+	ID               uint64    `json:"id,string"`
+	Name             string    `json:"name"`
+	ProxyDisplay     string    `json:"proxyDisplay,omitempty"`
+	ProxyFingerprint string    `json:"proxyFingerprint,omitempty"`
+	BoundNodeCount   int       `json:"boundNodeCount"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+func (h *Handler) listProxyProfiles(c *gin.Context) {
+	page, pageSize := nodePagination(c)
+	values, total, err := h.service.ListProxyProfiles(c.Request.Context(), page, pageSize, c.Query("search"))
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	items := make([]proxyProfileResponse, 0, len(values))
+	for _, value := range values {
+		items = append(items, newProxyProfileResponse(value))
+	}
+	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+func (h *Handler) createProxyProfile(c *gin.Context) {
+	var request proxyProfileRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	value, err := h.service.CreateProxyProfile(c.Request.Context(), egressapp.ProxyProfileInput{Name: request.Name, ProxyURL: request.ProxyURL})
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusCreated, newProxyProfileResponse(value))
+}
+
+func (h *Handler) getProxyProfile(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	value, err := h.service.GetProxyProfile(c.Request.Context(), id)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, newProxyProfileResponse(value))
+}
+
+func (h *Handler) updateProxyProfile(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request proxyProfileRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	value, err := h.service.UpdateProxyProfile(c.Request.Context(), id, egressapp.ProxyProfileInput{Name: request.Name, ProxyURL: request.ProxyURL})
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, newProxyProfileResponse(value))
+}
+
+func (h *Handler) deleteProxyProfile(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.DeleteProxyProfile(c.Request.Context(), id); err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"deleted": true})
+}
+
+func (h *Handler) proxyProfileURL(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Pragma", "no-cache")
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	value, err := h.service.ProxyProfileURL(c.Request.Context(), id)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"proxyURL": value})
+}
+
+func newProxyProfileResponse(value egressdomain.PublicProxyProfile) proxyProfileResponse {
+	return proxyProfileResponse{
+		ID: value.ID, Name: value.Name, ProxyDisplay: value.ProxyDisplay, ProxyFingerprint: value.ProxyFingerprint,
+		BoundNodeCount: value.BoundNodeCount, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+	}
+}
+
 func newNodeResponse(value egressdomain.PublicNode) nodeResponse {
 	return nodeResponse{
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled,
-		ProxyConfigured: value.ProxyConfigured, ProxyPool: value.ProxyPool, UserAgent: value.UserAgent, CookieConfigured: value.CookieConfigured,
+		ProxyConfigured: value.ProxyConfigured, ProxyDisplay: value.ProxyDisplay, ProxyFingerprint: value.ProxyFingerprint,
+		ProxyPool: value.ProxyPool, UserAgent: value.UserAgent, CookieConfigured: value.CookieConfigured,
 		AccountBoundProxy: value.AccountBoundProxy,
 		SourceID:          value.SourceID, AccountCapacity: value.AccountCapacity,
+		ProxyProfileID: value.ProxyProfileID, ProxyProfileName: value.ProxyProfileName,
 		Health: value.Health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,
 		ProbeStatus: string(value.ProbeStatus), LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
 		ProbeProvider: string(value.ProbeProvider),
@@ -423,6 +1128,8 @@ type sourceRequest struct {
 	Enabled                bool    `json:"enabled"`
 	URL                    *string `json:"url"`
 	ClearURL               bool    `json:"clearUrl"`
+	ProxyURL               *string `json:"proxyURL"`
+	ClearProxyURL          bool    `json:"clearProxyURL"`
 	RefreshIntervalSeconds *int    `json:"refreshIntervalSeconds"`
 	DefaultAccountCapacity *int    `json:"defaultAccountCapacity"`
 }
@@ -433,6 +1140,7 @@ type sourceResponse struct {
 	Scope                  string     `json:"scope"`
 	Enabled                bool       `json:"enabled"`
 	URLConfigured          bool       `json:"urlConfigured"`
+	ProxyConfigured        bool       `json:"proxyConfigured"`
 	RefreshIntervalSeconds int        `json:"refreshIntervalSeconds"`
 	DefaultAccountCapacity int        `json:"defaultAccountCapacity"`
 	LastSyncedAt           *time.Time `json:"lastSyncedAt,omitempty"`
@@ -509,6 +1217,7 @@ func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, e
 func (value sourceRequest) input() egressapp.SubscriptionSourceInput {
 	return egressapp.SubscriptionSourceInput{
 		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled, URL: value.URL, ClearURL: value.ClearURL,
+		ProxyURL: value.ProxyURL, ClearProxyURL: value.ClearProxyURL,
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 	}
 }
@@ -516,14 +1225,15 @@ func (value sourceRequest) input() egressapp.SubscriptionSourceInput {
 func newSourceResponse(value egressdomain.PublicSubscriptionSource) sourceResponse {
 	return sourceResponse{
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, URLConfigured: value.URLConfigured,
+		ProxyConfigured:        value.ProxyConfigured,
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 		LastSyncedAt: value.LastSyncedAt, NextSyncAt: value.NextSyncAt, LastSyncImported: value.LastSyncImported, LastSyncError: value.LastSyncError,
 	}
 }
 
 func newOperationsConfigResponse(value egressdomain.OperationsConfig) operationsConfigResponse {
-	fallbacks := make(map[string]operationsFallbackResponse, 4)
-	for _, scope := range []egressdomain.Scope{egressdomain.ScopeBuild, egressdomain.ScopeWeb, egressdomain.ScopeConsole, egressdomain.ScopeWebAsset} {
+	fallbacks := make(map[string]operationsFallbackResponse, 5)
+	for _, scope := range []egressdomain.Scope{egressdomain.ScopeBuild, egressdomain.ScopeWeb, egressdomain.ScopeConsole, egressdomain.ScopeWebAsset, egressdomain.ScopeConsoleAsset} {
 		fallback := value.FallbackFor(scope)
 		item := operationsFallbackResponse{Mode: string(fallback.Mode)}
 		if fallback.NodeID != 0 {
@@ -539,6 +1249,21 @@ func newOperationsConfigResponse(value egressdomain.OperationsConfig) operations
 }
 
 func (h *Handler) listSources(c *gin.Context) {
+	if !legacyEgressSourceListRequest(c) {
+		page, pageSize := nodePagination(c)
+		values, total, err := h.service.ListSourcePage(c.Request.Context(), page, pageSize, c.Query("search"), egressapp.SourceListFilter{
+			Scope: egressdomain.Scope(c.Query("scope")),
+		})
+		if h.writeSourceListError(c, err) {
+			return
+		}
+		items := make([]sourceResponse, 0, len(values))
+		for _, value := range values {
+			items = append(items, newSourceResponse(value))
+		}
+		response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+		return
+	}
 	values, err := h.service.ListSources(c.Request.Context())
 	if err != nil {
 		h.writeError(c, err)
@@ -549,6 +1274,28 @@ func (h *Handler) listSources(c *gin.Context) {
 		items = append(items, newSourceResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items})
+}
+
+func legacyEgressSourceListRequest(c *gin.Context) bool {
+	if _, exists := c.GetQuery("page"); exists {
+		return false
+	}
+	if _, exists := c.GetQuery("pageSize"); exists {
+		return false
+	}
+	return c.Query("search") == "" && c.Query("scope") == ""
+}
+
+func (h *Handler) writeSourceListError(c *gin.Context, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, egressapp.ErrInvalidFilter):
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+	default:
+		response.Error(c, http.StatusInternalServerError, "egressSourceListFailed", "读取代理订阅来源失败")
+	}
+	return true
 }
 
 func (h *Handler) createSource(c *gin.Context) {
@@ -715,6 +1462,12 @@ func (h *Handler) writeError(c *gin.Context, err error) {
 		response.Error(c, http.StatusBadRequest, "invalidEgressNode", err.Error())
 	case errors.Is(err, egressapp.ErrNotFound):
 		response.Error(c, http.StatusNotFound, "egressNodeNotFound", err.Error())
+	case errors.Is(err, egressapp.ErrProxyProfileNotFound):
+		response.Error(c, http.StatusNotFound, "egressProxyProfileNotFound", err.Error())
+	case errors.Is(err, egressapp.ErrProxyProfileInUse):
+		response.Error(c, http.StatusConflict, "egressProxyProfileInUse", err.Error())
+	case errors.Is(err, egressapp.ErrProxyProfileUnavailable):
+		response.Error(c, http.StatusServiceUnavailable, "egressProxyProfilesUnavailable", err.Error())
 	case errors.Is(err, egressapp.ErrProbeStale):
 		response.Error(c, http.StatusConflict, "egressProbeStale", err.Error())
 	case errors.Is(err, repository.ErrConflict):
@@ -725,10 +1478,25 @@ func (h *Handler) writeError(c *gin.Context, err error) {
 		response.Error(c, http.StatusBadGateway, "egressSubscriptionSyncFailed", "代理订阅同步失败")
 	case errors.Is(err, egressapp.ErrClearanceUnavailable):
 		response.Error(c, http.StatusConflict, "clearanceRefreshUnavailable", err.Error())
+	case errors.Is(err, egressapp.ErrQualityProbeUnavailable):
+		response.Error(c, http.StatusServiceUnavailable, "egressQualityProbeUnavailable", err.Error())
 	case strings.Contains(err.Error(), "FlareSolverr") || strings.Contains(err.Error(), "Clearance"):
 		response.Error(c, http.StatusBadGateway, "clearanceRefreshFailed", err.Error())
 	default:
 		response.Error(c, http.StatusInternalServerError, "egressNodeOperationFailed", "代理节点操作失败")
+	}
+}
+
+func (h *Handler) writeQualityProbeError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, egressapp.ErrQualityProbeNoAccount):
+		response.Error(c, http.StatusServiceUnavailable, "egressQualityProbeNoAccount", "质量检测暂无可调度账号，请稍后重试")
+	case errors.Is(err, egressapp.ErrInvalidInput),
+		errors.Is(err, egressapp.ErrNotFound),
+		errors.Is(err, egressapp.ErrQualityProbeUnavailable):
+		h.writeError(c, err)
+	default:
+		response.Error(c, http.StatusBadGateway, "egressQualityProbeFailed", "质量检测暂不可用，请稍后重试")
 	}
 }
 

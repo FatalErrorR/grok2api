@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Webhook } from "lucide-react";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, TimerOff, Trash2, TriangleAlert, Webhook } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -37,12 +37,14 @@ import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/tabl
 import {
   acceptWebAccountTerms,
   cleanupAccounts,
+  clearAccountCooldown,
   deleteAccount,
   deleteAccounts,
   previewAccountDeletion,
   previewCleanup,
   enableWebAccountNSFW,
   convertWebAccountsToBuild,
+  detectBuildAccounts,
   exportAccountBatch,
   exportSelectedAccounts,
   getAccountSummary,
@@ -78,6 +80,7 @@ import {
   type AccountTaskProgressDTO,
   type BuildConversionInput,
   type BuildConversionStrategy,
+  type BuildDetectItemDTO,
   type WebConsoleSyncInput,
   type WebAccountScriptActions,
   type WebAccountScriptsInput,
@@ -88,20 +91,21 @@ import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/accoun
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
-import { assignEgressAccounts, listAllEgressNodes, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
+import { assignEgressAccounts, listAllEgressNodes, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
 
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
 }
 
-type BuildConversionProgressState = {
-  converting?: AccountTaskProgressDTO;
-  syncing?: AccountTaskProgressDTO;
-};
-
 type WebConversionTarget = "build" | "console";
 type BuildQuotaTask = "sync" | "reset";
 type EgressConfigurationTask = "bind" | "unbind";
+type BuildDetectCounts = Record<BuildDetectItemDTO["outcome"], number>;
+
+const emptyBuildDetectCounts = (): BuildDetectCounts => ({ ok: 0, invalid: 0, failed: 0 });
+
+const egressFilterNodePageSize = 100;
+const egressFilterSourcePageSize = 100;
 
 type AccountSelection = {
   provider: AccountProvider;
@@ -114,6 +118,8 @@ export function AccountsPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const quickImportFileInputRef = useRef<HTMLInputElement>(null);
   const quotaSyncAbortRef = useRef<AbortController | null>(null);
+  const detectAbortRef = useRef<AbortController | null>(null);
+  const detectOutcomeByIDRef = useRef(new Map<string, BuildDetectItemDTO["outcome"]>());
   const renewalAbortRef = useRef<AbortController | null>(null);
   const conversionAbortRef = useRef<AbortController | null>(null);
   const webConsoleSyncAbortRef = useRef<AbortController | null>(null);
@@ -127,6 +133,9 @@ export function AccountsPage() {
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [egressFilter, setEgressFilter] = useState("");
+  const [egressFilterSelectedLabel, setEgressFilterSelectedLabel] = useState("");
+  const [egressFilterOptionsOpen, setEgressFilterOptionsOpen] = useState(false);
+  const [egressFilterOptionsSearch, setEgressFilterOptionsSearch] = useState("");
   const [renewalFilter, setRenewalFilter] = useState("");
   const [riskFilter, setRiskFilter] = useState("");
   const [agreementFilter, setAgreementFilter] = useState("");
@@ -156,12 +165,17 @@ export function AccountsPage() {
   const [exportBatchNumber, setExportBatchNumber] = useState(1);
   const [exportCompletedCount, setExportCompletedCount] = useState(0);
   const [syncAllOpen, setSyncAllOpen] = useState(false);
+  const [detectDialogOpen, setDetectDialogOpen] = useState(false);
+  const [detectMode, setDetectMode] = useState<"selected" | "all">("all");
   const [allQuotaTask, setAllQuotaTask] = useState<BuildQuotaTask>("sync");
   const [quotaSyncProgress, setQuotaSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [detectProgress, setDetectProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [detectItems, setDetectItems] = useState<BuildDetectItemDTO[]>([]);
+  const [detectCounts, setDetectCounts] = useState<BuildDetectCounts>(emptyBuildDetectCounts);
   const [webConversionTargets, setWebConversionTargets] = useState<string[] | "all" | null>(null);
   const [webConversionTarget, setWebConversionTarget] = useState<WebConversionTarget>("build");
   const [webConversionStrategy, setWebConversionStrategy] = useState<BuildConversionStrategy>("missing");
-  const [conversionProgress, setConversionProgress] = useState<BuildConversionProgressState | null>(null);
+  const [conversionProgress, setConversionProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [webConsoleSyncProgress, setWebConsoleSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [webAccountScriptsTargets, setWebAccountScriptsTargets] = useState<string[] | "all" | null>(null);
   const [webAccountScriptsProgress, setWebAccountScriptsProgress] = useState<AccountTaskProgressDTO | null>(null);
@@ -180,9 +194,11 @@ export function AccountsPage() {
   const [quickImportTokens, setQuickImportTokens] = useState("");
   const [webConfirmationTarget, setWebConfirmationTarget] = useState<WebAccountConfirmationTarget | null>(null);
   const debouncedSearch = useDebouncedValue(search);
+  const debouncedEgressFilterOptionsSearch = useDebouncedValue(egressFilterOptionsSearch);
 
   useEffect(() => () => {
     quotaSyncAbortRef.current?.abort();
+    detectAbortRef.current?.abort();
     renewalAbortRef.current?.abort();
     conversionAbortRef.current?.abort();
     webConsoleSyncAbortRef.current?.abort();
@@ -233,10 +249,70 @@ export function AccountsPage() {
     queryKey: ["accounts", "summary"],
     queryFn: getAccountSummary,
   });
+  // The binding dialog still needs every compatible node, but only while open.
   const egressNodesQuery = useQuery({
     queryKey: ["egress-nodes", "account-binding"],
     queryFn: () => listAllEgressNodes(),
     enabled: egressConfigurationOpen && egressConfigurationTask === "bind",
+    staleTime: 60_000,
+  });
+  // Filter choices are loaded only when the third-level menu opens. Nodes and
+  // subscription sources use bounded pages so large pools do not flood the page.
+  const egressFilterPrimaryScope = accountProviderPrimaryEgressScope(provider);
+  const egressFilterNodesQuery = useInfiniteQuery({
+    queryKey: ["egress-nodes", "account-filter", egressFilterPrimaryScope, debouncedEgressFilterOptionsSearch],
+    queryFn: ({ pageParam }) => listEgressNodes({
+      page: pageParam,
+      pageSize: egressFilterNodePageSize,
+      search: debouncedEgressFilterOptionsSearch,
+      scope: egressFilterPrimaryScope,
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
+    enabled: egressFilterOptionsOpen,
+    staleTime: 60_000,
+  });
+  // Console routing supports both native Console exits and Grok Web exits. Keep
+  // the second scope independently paginated so unrelated Build/asset nodes can
+  // never consume the Console result pages.
+  const egressFilterConsoleWebNodesQuery = useInfiniteQuery({
+    queryKey: ["egress-nodes", "account-filter", "console-web", debouncedEgressFilterOptionsSearch],
+    queryFn: ({ pageParam }) => listEgressNodes({
+      page: pageParam,
+      pageSize: egressFilterNodePageSize,
+      search: debouncedEgressFilterOptionsSearch,
+      scope: "grok_web",
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
+    enabled: egressFilterOptionsOpen && provider === "grok_console",
+    staleTime: 60_000,
+  });
+  const egressFilterSourcesQuery = useInfiniteQuery({
+    queryKey: ["egress-sources", "account-filter", egressFilterPrimaryScope, debouncedEgressFilterOptionsSearch],
+    queryFn: ({ pageParam }) => listEgressSources({
+      page: pageParam,
+      pageSize: egressFilterSourcePageSize,
+      search: debouncedEgressFilterOptionsSearch,
+      scope: egressFilterPrimaryScope,
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
+    enabled: egressFilterOptionsOpen,
+    staleTime: 60_000,
+  });
+  const egressFilterConsoleWebSourcesQuery = useInfiniteQuery({
+    queryKey: ["egress-sources", "account-filter", "console-web", debouncedEgressFilterOptionsSearch],
+    queryFn: ({ pageParam }) => listEgressSources({
+      page: pageParam,
+      pageSize: egressFilterSourcePageSize,
+      search: debouncedEgressFilterOptionsSearch,
+      scope: "grok_web",
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
+    enabled: egressFilterOptionsOpen && provider === "grok_console",
+    staleTime: 60_000,
   });
 
   const invalidateAccountData = useCallback(() => {
@@ -249,11 +325,11 @@ export function AccountsPage() {
       if (!editing) throw new Error(t("errors.generic"));
       const input: AccountUpdateInput = {
         name: values.name,
-        enabled: values.enabled,
         priority: values.priority,
         maxConcurrent: values.maxConcurrent,
         minimumRemaining: values.minimumRemaining,
       };
+      if (values.enabled !== editing.enabled) input.enabled = values.enabled;
       if (editing.provider !== "grok_build") {
         if (values.clearCloudflareCookies) input.clearCloudflareCookies = true;
         else if (values.cloudflareCookies.trim()) input.cloudflareCookies = values.cloudflareCookies;
@@ -269,6 +345,7 @@ export function AccountsPage() {
       if (entitlementChanged) void queryClient.invalidateQueries({ queryKey: ["models"] });
       setEditing(null);
       if (account.modelSyncFailed) toast.warning(t("accounts.updatedWithModelSyncFailure"));
+      else if (account.enabledDoesNotClearCooldown) toast.warning(t("accounts.enabledDoesNotClearCooldown"));
       else toast.success(t("accounts.updated"));
     },
     onError: showError,
@@ -432,6 +509,15 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const clearCooldownMutation = useMutation({
+    mutationFn: clearAccountCooldown,
+    onSuccess: () => {
+      invalidateAccountData();
+      toast.success(t("accounts.cooldownCleared"));
+    },
+    onError: showError,
+  });
+
   const quotaMutation = useMutation({
     mutationFn: refreshAccountQuota,
     onSuccess: () => {
@@ -506,10 +592,7 @@ export function AccountsPage() {
       const controller = new AbortController();
       conversionAbortRef.current = controller;
       setConversionProgress(null);
-      return convertWebAccountsToBuild(input, (progress) => {
-        const phase = progress.phase === "syncing" ? "syncing" : "converting";
-        setConversionProgress((current) => ({ ...(current ?? {}), [phase]: progress }));
-      }, controller.signal);
+      return convertWebAccountsToBuild(input, setConversionProgress, controller.signal);
     },
     onSuccess: (conversion) => {
       setConversionProgress(null);
@@ -590,6 +673,10 @@ export function AccountsPage() {
       importAbortRef.current = null;
       setQuickImportOpen(false);
       setQuickImportTokens("");
+      if (result.failed > 0) {
+        toast.warning(t("accounts.importedWithFailures", result));
+        return;
+      }
       if (result.syncFailed > 0) {
         toast.warning(t("accounts.importedWithSyncFailures", result));
         return;
@@ -669,6 +756,72 @@ export function AccountsPage() {
     },
     onError: showError,
   });
+
+  const appendDetectItem = useCallback((item: BuildDetectItemDTO) => {
+    const previousOutcome = detectOutcomeByIDRef.current.get(item.id);
+    detectOutcomeByIDRef.current.set(item.id, item.outcome);
+    if (previousOutcome !== item.outcome) {
+      setDetectCounts((previous) => ({
+        ...previous,
+        ...(previousOutcome ? { [previousOutcome]: Math.max(0, previous[previousOutcome] - 1) } : {}),
+        [item.outcome]: previous[item.outcome] + 1,
+      }));
+    }
+    setDetectItems((prev) => {
+      const next = prev.filter((entry) => entry.id !== item.id);
+      next.unshift(item);
+      return next.slice(0, 200);
+    });
+  }, []);
+
+  const detectMutation = useMutation({
+    mutationFn: (mode: "selected" | "all") => {
+      const controller = new AbortController();
+      detectAbortRef.current = controller;
+      setDetectProgress(null);
+      detectOutcomeByIDRef.current.clear();
+      setDetectCounts(emptyBuildDetectCounts());
+      setDetectItems([]);
+      const handlers = {
+        onProgress: setDetectProgress,
+        onItem: appendDetectItem,
+      };
+      if (mode === "all") {
+        return detectBuildAccounts({ all: true }, handlers, controller.signal);
+      }
+      return detectBuildAccounts({ ids: [...selected] }, handlers, controller.signal);
+    },
+    onSuccess: (result, mode) => {
+      if (mode === "selected") clearSelection();
+      toast.success(t(mode === "all" ? "accounts.allDetected" : "accounts.batchDetected", result));
+    },
+    onError: (error) => { if (!isAbortError(error)) showError(error); },
+    onSettled: () => {
+      detectAbortRef.current = null;
+      invalidateAccountData();
+    },
+  });
+
+  const openDetectDialog = (mode: "selected" | "all") => {
+    setDetectMode(mode);
+    setDetectProgress(null);
+    detectOutcomeByIDRef.current.clear();
+    setDetectCounts(emptyBuildDetectCounts());
+    setDetectItems([]);
+    setDetectDialogOpen(true);
+  };
+
+  const closeDetectDialog = (open: boolean) => {
+    if (!open) {
+      if (detectMutation.isPending) detectAbortRef.current?.abort();
+      setDetectDialogOpen(false);
+      setDetectProgress(null);
+      // 保留结果列表直到下次打开，便于查看完成摘要；关闭后清空避免残留。
+      if (!detectMutation.isPending) setDetectItems([]);
+      return;
+    }
+    setDetectDialogOpen(true);
+  };
 
   const batchQuotaResetMutation = useMutation({
     mutationFn: () => resetAccountsQuota([...selected], provider),
@@ -855,6 +1008,12 @@ export function AccountsPage() {
     setSelection({ provider: value, ids: new Set() });
     setTypeFilter("");
     setStatusFilter("");
+    // A node or subscription narrowing belongs to the previous pool's scope;
+    // keep the plain bound filter and drop the target.
+    setEgressFilter((current) => (current.includes(":") ? "bound" : current));
+    setEgressFilterSelectedLabel("");
+    setEgressFilterOptionsOpen(false);
+    setEgressFilterOptionsSearch("");
     setRenewalFilter("");
     setRiskFilter("");
     setAgreementFilter("");
@@ -873,7 +1032,7 @@ export function AccountsPage() {
   function submitQuickImport(): void {
     const value = quickImportTokens.trim();
     if (!value) return;
-    const filename = provider === "grok_console" ? "grok-console-sso-tokens.txt" : "grok-web-sso-tokens.txt";
+    const filename = provider === "grok_build" ? "grok-build-refresh-tokens.txt" : provider === "grok_console" ? "grok-console-sso-tokens.txt" : "grok-web-sso-tokens.txt";
     importMutation.mutate([new File([value], filename, { type: "text/plain" })]);
   }
 
@@ -954,11 +1113,6 @@ export function AccountsPage() {
     });
   }
 
-  const convertingProgress = conversionProgress?.converting;
-  const syncingProgress = conversionProgress?.syncing;
-  const activeConversionProgress = convertingProgress?.completed === convertingProgress?.total && syncingProgress
-    ? syncingProgress
-    : convertingProgress ?? syncingProgress;
   const webConversionPending = conversionMutation.isPending || webConsoleSyncMutation.isPending;
 
   function showError(error: unknown): void {
@@ -1019,6 +1173,9 @@ export function AccountsPage() {
 
   const summary = summaryQuery.data;
   const recoveringAccounts = summary?.recovering ?? 0;
+  const cooldownAccounts = summary?.recovery.cooldown ?? 0;
+  const waitingResetAccounts = summary?.recovery.waitingReset ?? 0;
+  const probingAccounts = summary?.recovery.probing ?? 0;
   const disabledAccounts = summary?.issues.disabled ?? 0;
   const invalidAccounts = summary?.issues.reauthRequired ?? 0;
   const riskAccounts = summary?.risk ?? 0;
@@ -1028,9 +1185,76 @@ export function AccountsPage() {
   const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0 };
   const summaryLoading = summaryQuery.isPending;
   const summaryUnavailable = summaryQuery.isError;
+  const abnormalBreakdown = [
+    { label: t("accounts.statusCooldown"), count: cooldownAccounts, tone: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+    { label: t("accounts.waitingReset"), count: waitingResetAccounts, tone: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+    { label: t("accounts.probing"), count: probingAccounts, tone: "bg-sky-500/10 text-sky-700 dark:text-sky-300" },
+    { label: t("accounts.riskFilter"), count: riskAccounts, tone: "bg-orange-500/10 text-orange-700 dark:text-orange-300" },
+    { label: t("accounts.statusDisabled"), count: disabledAccounts, tone: "bg-muted text-muted-foreground" },
+    { label: t("accounts.statusReauthRequired"), count: invalidAccounts, tone: "bg-red-500/10 text-red-700 dark:text-red-300" },
+  ];
+  const abnormalDetail = abnormalBreakdown.map((item) => `${item.label} ${formatNumber(item.count, i18n.language, 0)}`).join(" · ");
+  const abnormalDetailItems = summaryUnavailable
+    ? [{ label: "-", value: "", tone: "bg-muted text-muted-foreground" }]
+    : abnormalBreakdown
+      .filter((item) => item.count > 0)
+      .map((item) => ({ ...item, value: formatNumber(item.count, i18n.language, 0) }));
+  if (!summaryUnavailable && abnormalDetailItems.length === 0) {
+    abnormalDetailItems.push({ label: t("accounts.statusActive"), value: "", tone: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300", count: 0 });
+  }
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
   const hasProviderAccounts = providerAccountTotal > 0 || (result?.total ?? 0) > 0;
   const bindableEgressNodes = (egressNodesQuery.data?.items ?? []).filter((node) => node.enabled && node.proxyConfigured && scopeSupportsAccountProvider(node.scope, provider));
+  const egressFilterSearchTerm = egressFilterOptionsSearch.trim().toLocaleLowerCase();
+  const consoleWebNodePages = provider === "grok_console" ? (egressFilterConsoleWebNodesQuery.data?.pages ?? []) : [];
+  const scopedEgressNodes = [...(egressFilterNodesQuery.data?.pages ?? []), ...consoleWebNodePages]
+    .flatMap((nodePage) => nodePage.items)
+    .filter((node) => scopeSupportsAccountProvider(node.scope, provider))
+    .filter((node) => !egressFilterSearchTerm || node.name.toLocaleLowerCase().includes(egressFilterSearchTerm));
+  const consoleWebNodesEnabled = provider === "grok_console";
+  const consoleWebSourcePages = consoleWebNodesEnabled ? (egressFilterConsoleWebSourcesQuery.data?.pages ?? []) : [];
+  const scopedEgressSources = [...(egressFilterSourcesQuery.data?.pages ?? []), ...consoleWebSourcePages]
+    .flatMap((sourcePage) => sourcePage.items)
+    .filter((source) => scopeSupportsAccountProvider(source.scope, provider))
+    .filter((source) => !egressFilterSearchTerm || source.name.toLocaleLowerCase().includes(egressFilterSearchTerm));
+  const egressFilterNodesFailed = egressFilterNodesQuery.isError || (consoleWebNodesEnabled && egressFilterConsoleWebNodesQuery.isError);
+  const egressFilterNodesFetching = egressFilterNodesQuery.isFetching || (consoleWebNodesEnabled && egressFilterConsoleWebNodesQuery.isFetching);
+  const egressFilterNodesHaveMore = egressFilterNodesFailed || egressFilterNodesQuery.hasNextPage || (consoleWebNodesEnabled && egressFilterConsoleWebNodesQuery.hasNextPage);
+  const loadMoreEgressFilterNodes = () => {
+    if (egressFilterNodesQuery.isError) void egressFilterNodesQuery.refetch();
+    if (consoleWebNodesEnabled && egressFilterConsoleWebNodesQuery.isError) void egressFilterConsoleWebNodesQuery.refetch();
+    if (egressFilterNodesFailed) return;
+    if (egressFilterNodesQuery.hasNextPage) void egressFilterNodesQuery.fetchNextPage();
+    if (consoleWebNodesEnabled && egressFilterConsoleWebNodesQuery.hasNextPage) void egressFilterConsoleWebNodesQuery.fetchNextPage();
+  };
+  const egressFilterSourcesFailed = egressFilterSourcesQuery.isError || (consoleWebNodesEnabled && egressFilterConsoleWebSourcesQuery.isError);
+  const egressFilterSourcesFetching = egressFilterSourcesQuery.isFetching || (consoleWebNodesEnabled && egressFilterConsoleWebSourcesQuery.isFetching);
+  const egressFilterSourcesHaveMore = egressFilterSourcesFailed || egressFilterSourcesQuery.hasNextPage || (consoleWebNodesEnabled && egressFilterConsoleWebSourcesQuery.hasNextPage);
+  const loadMoreEgressFilterSources = () => {
+    if (egressFilterSourcesQuery.isError) void egressFilterSourcesQuery.refetch();
+    if (consoleWebNodesEnabled && egressFilterConsoleWebSourcesQuery.isError) void egressFilterConsoleWebSourcesQuery.refetch();
+    if (egressFilterSourcesFailed) return;
+    if (egressFilterSourcesQuery.hasNextPage) void egressFilterSourcesQuery.fetchNextPage();
+    if (consoleWebNodesEnabled && egressFilterConsoleWebSourcesQuery.hasNextPage) void egressFilterConsoleWebSourcesQuery.fetchNextPage();
+  };
+  const egressBoundGroups = [
+    {
+      id: "nodes", label: t("accounts.egressNodeGroup"),
+      emptyLabel: egressFilterNodesFailed ? t("accounts.egressFilterOptionsLoadFailed") : egressFilterNodesFetching ? t("common.loading") : t("accounts.egressNodeGroupEmpty"),
+      options: scopedEgressNodes.map((node) => ({ value: `node:${node.id}`, label: node.name })),
+      loading: egressFilterNodesFetching, hasMore: egressFilterNodesHaveMore,
+      actionLabel: egressFilterNodesFailed ? t("common.retry") : egressFilterNodesFetching ? t("common.loading") : t("accounts.egressFilterOptionsLoadMore"),
+      onAction: loadMoreEgressFilterNodes,
+    },
+    {
+      id: "sources", label: t("accounts.egressSourceGroup"),
+      emptyLabel: egressFilterSourcesFailed ? t("accounts.egressFilterOptionsLoadFailed") : egressFilterSourcesFetching ? t("common.loading") : t("accounts.egressSourceGroupEmpty"),
+      options: scopedEgressSources.map((source) => ({ value: `source:${source.id}`, label: source.name })),
+      loading: egressFilterSourcesFetching, hasMore: egressFilterSourcesHaveMore,
+      actionLabel: egressFilterSourcesFailed ? t("common.retry") : egressFilterSourcesFetching ? t("common.loading") : t("accounts.egressFilterSourcesLoadMore"),
+      onAction: loadMoreEgressFilterSources,
+    },
+  ];
   const bulkTaskPending = quotaSyncMutation.isPending
     || allQuotaResetMutation.isPending
     || allTokenMutation.isPending
@@ -1040,6 +1264,7 @@ export function AccountsPage() {
     || batchUpdateMutation.isPending
     || batchConcurrencyMutation.isPending
     || batchBillingMutation.isPending
+    || detectMutation.isPending
     || batchQuotaResetMutation.isPending
     || batchTokenMutation.isPending
     || batchDeleteMutation.isPending
@@ -1048,6 +1273,9 @@ export function AccountsPage() {
     || cleanupMutation.isPending
     || webConfirmationMutation.isPending
     || webAccountScriptsMutation.isPending;
+
+  const detectInvalidItems = detectItems.filter((item) => item.outcome === "invalid");
+  const detectVisibleItems = detectMode === "selected" ? detectItems : detectInvalidItems;
 
   return (
     <div className="space-y-5">
@@ -1065,12 +1293,8 @@ export function AccountsPage() {
           loading={summaryLoading}
           label={t("accounts.abnormalAccountCount")}
           value={summaryUnavailable ? "-" : formatNumber(abnormalAccounts, i18n.language, 0)}
-          detail={[
-            `${t("accounts.statusCooldown")} ${formatNumber(recoveringAccounts, i18n.language, 0)}`,
-            `${t("accounts.riskAccountCount", { count: formatNumber(riskAccounts, i18n.language, 0) })}`,
-            `${t("accounts.statusDisabled")} ${formatNumber(disabledAccounts, i18n.language, 0)}`,
-            `${t("accounts.statusReauthRequired")} ${formatNumber(invalidAccounts, i18n.language, 0)}`,
-          ].join(" · ")}
+          detail={abnormalDetail}
+          detailItems={abnormalDetailItems}
         />
       </section>
       <div className="space-y-5">
@@ -1095,7 +1319,7 @@ export function AccountsPage() {
             <DropdownMenuTrigger asChild><Button size="sm"><Plus />{t("accounts.connectAccount")}</Button></DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               {provider === "grok_build" ? <DropdownMenuItem onClick={() => void startDeviceLogin()}><ExternalLink />{t("accounts.deviceLogin")}</DropdownMenuItem> : null}
-              {provider !== "grok_build" ? <DropdownMenuItem disabled={bulkTaskPending} onClick={() => setQuickImportOpen(true)}><ClipboardPaste />{t("accounts.quickImportSSO")}</DropdownMenuItem> : null}
+              <DropdownMenuItem disabled={bulkTaskPending} onClick={() => setQuickImportOpen(true)}><ClipboardPaste />{t(provider === "grok_build" ? "accounts.quickImportRT" : "accounts.quickImportSSO")}</DropdownMenuItem>
               <DropdownMenuItem disabled={bulkTaskPending} onClick={() => fileInputRef.current?.click()}><FileUp />{provider === "grok_build" ? t("accounts.importAuth") : provider === "grok_console" ? t("console.importFile") : t("accounts.importWebFile")}</DropdownMenuItem>
               {hasProviderAccounts ? (
                 <>
@@ -1148,8 +1372,20 @@ export function AccountsPage() {
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
                 ] },
-                { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, onChange: (value) => { setEgressFilter(value); setPage(1); }, options: [
-                  { value: "bound", label: t("accounts.egressBound") },
+                { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, selectedLabel: egressFilterSelectedLabel || undefined, onChange: (value) => {
+                  setEgressFilter(value);
+                  setEgressFilterSelectedLabel(value.includes(":")
+                    ? egressBoundGroups.flatMap((group) => group.options).find((option) => option.value === value)?.label ?? ""
+                    : "");
+                  setPage(1);
+                }, options: [
+                  {
+                    value: "bound", label: t("accounts.egressBound"), groups: egressBoundGroups,
+                    onGroupsOpenChange: setEgressFilterOptionsOpen,
+                    groupSearch: { value: egressFilterOptionsSearch, placeholder: t("accounts.egressFilterOptionsSearch"), onChange: (value) => {
+                      setEgressFilterOptionsSearch(value);
+                    } },
+                  },
                   { value: "unbound", label: t("accounts.egressUnbound") },
                 ] },
                 ...(provider === "grok_build" ? [{ id: "renewal", label: t("accountCredential.label"), value: renewalFilter, onChange: (value: string) => { setRenewalFilter(value); setPage(1); }, options: [
@@ -1198,6 +1434,7 @@ export function AccountsPage() {
                 }}>{t("accounts.egressConfiguration")}</Button>
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets([...selected])}>{t("webAccountScripts.action")}</Button> : null}
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("selected")}>{t("accountCredential.detectAction")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
                   if (provider === "grok_build") {
                     setBatchQuotaTask("sync");
@@ -1213,6 +1450,7 @@ export function AccountsPage() {
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion("all")}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets("all")}>{t("webAccountScripts.action")}</Button> : null}
+                {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("all")}>{t("accountCredential.detectAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => { setAllQuotaTask("sync"); setSyncAllOpen(true); }}>{t("accountCredential.quotaSyncAction")}</Button> : null}
                 {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => { resetCleanupState(); setCleanupOpen(true); }}><Trash2 />{t("accounts.cleanupAction")}</Button> : null}
@@ -1285,6 +1523,11 @@ export function AccountsPage() {
                             />
                           ) : null}
                           {provider === "grok_build" ? <DropdownMenuItem onClick={() => tokenMutation.mutate(account.id)}><RotateCw />{t("accounts.refreshToken")}</DropdownMenuItem> : null}
+                          {account.cooldownUntil && new Date(account.cooldownUntil) > new Date() ? (
+                            <DropdownMenuItem onClick={() => clearCooldownMutation.mutate(account.id)} disabled={clearCooldownMutation.isPending}>
+                              <TimerOff />{t("accounts.clearCooldown")}
+                            </DropdownMenuItem>
+                          ) : null}
                           <DropdownMenuItem onClick={() => provider === "grok_build" ? billingMutation.mutate(account.id) : quotaMutation.mutate(account.id)}><RefreshCw />{provider === "grok_build" ? t("accounts.refreshBilling") : t("accounts.refreshModeQuota")}</DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => { resetLinkedDeleteState(); setDeleting(account); }}><Trash2 />{t("common.delete")}</DropdownMenuItem>
@@ -1354,6 +1597,86 @@ export function AccountsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
+      <Dialog open={detectDialogOpen} onOpenChange={closeDetectDialog}>
+        <DialogContent className="max-w-xl gap-4 sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{detectMode === "all" ? t("accounts.detectAllTitle") : t("accounts.detectSelectedTitle", { count: selected.size })}</DialogTitle>
+            <DialogDescription>{detectMode === "all" ? t("accounts.detectAllDescription") : t("accounts.detectSelectedDescription", { count: selected.size })}</DialogDescription>
+          </DialogHeader>
+          {(detectMutation.isPending || detectProgress || detectVisibleItems.length > 0) ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2 text-sm">
+                <span className="text-muted-foreground">{t("accounts.detectProgressLabel")}</span>
+                <span className="tabular-nums font-medium">
+                  {detectProgress ? `${detectProgress.completed} / ${detectProgress.total}` : detectMutation.isPending ? t("common.loading") : "—"}
+                </span>
+              </div>
+              {detectMode === "all" && detectCounts.invalid > 0 ? (
+                <p className="text-xs text-muted-foreground">{t("accounts.detectInvalidCount", { count: detectCounts.invalid })}</p>
+              ) : null}
+              {detectMode === "selected" && (detectCounts.ok + detectCounts.invalid + detectCounts.failed) > 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  {t("accounts.detectSelectedSummary", {
+                    ok: detectCounts.ok,
+                    invalid: detectCounts.invalid,
+                    failed: detectCounts.failed,
+                  })}
+                </p>
+              ) : null}
+              {(detectCounts.ok + detectCounts.invalid + detectCounts.failed) > detectVisibleItems.length ? (
+                <p className="text-xs text-muted-foreground">{t("accounts.detectResultsLimited", { count: 200 })}</p>
+              ) : null}
+              <div className="max-h-64 overflow-y-auto rounded-md border">
+                {detectVisibleItems.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                    {detectMutation.isPending
+                      ? t(detectMode === "all" ? "accounts.detectWaitingInvalid" : "accounts.detectWaitingResults")
+                      : t(detectMode === "all" ? "accounts.detectNoInvalid" : "accounts.detectNoResults")}
+                  </div>
+                ) : (
+                  <ul className="divide-y">
+                    {detectVisibleItems.map((item) => (
+                      <li key={`${item.id}-${item.outcome}-${item.reason ?? ""}`} className="flex items-start gap-3 px-3 py-2 text-sm">
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "mt-0.5 shrink-0",
+                            item.outcome === "ok" && "border-emerald-500/40 text-emerald-700 dark:text-emerald-300",
+                            item.outcome === "invalid" && "border-destructive/40 text-destructive",
+                            item.outcome === "failed" && "border-amber-500/40 text-amber-700 dark:text-amber-300",
+                          )}
+                        >
+                          {t(`accounts.detectOutcome.${item.outcome}`)}
+                        </Badge>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-medium">{item.name || item.id}</div>
+                          {item.email ? <div className="truncate text-xs text-muted-foreground">{item.email}</div> : null}
+                          {item.reason ? <div className="mt-0.5 break-all text-xs text-muted-foreground">{item.reason}</div> : null}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => closeDetectDialog(false)}>{detectMutation.isPending ? t("common.cancel") : t("common.close")}</Button>
+            <Button
+              disabled={detectMutation.isPending || (detectMode === "selected" && selected.size === 0)}
+              onClick={() => detectMutation.mutate(detectMode)}
+            >
+              {detectMutation.isPending ? (
+                <>
+                  <Spinner />
+                  {detectProgress ? <span className="tabular-nums">{detectProgress.completed} / {detectProgress.total}</span> : t("common.loading")}
+                </>
+              ) : t("accounts.detectAll")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <AlertDialog open={webConversionTargets !== null} onOpenChange={(open) => { if (!open) closeWebConversion(); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -1384,7 +1707,7 @@ export function AccountsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={webConversionPending || webConversionTargets === null || (Array.isArray(webConversionTargets) && webConversionTargets.length === 0)} onClick={(event) => { event.preventDefault(); runWebConversion(); }}>
-              {webConversionPending ? <><Spinner />{webConversionTarget === "build" && activeConversionProgress ? <span className="whitespace-nowrap tabular-nums">{t(activeConversionProgress.phase === "syncing" ? "accounts.syncingProgress" : "accounts.convertingProgress", activeConversionProgress)}</span> : webConsoleSyncProgress ? <span className="tabular-nums">{webConsoleSyncProgress.completed} / {webConsoleSyncProgress.total}</span> : t("common.loading")}</> : t("accountConversion.start")}
+              {webConversionPending ? <><Spinner />{webConversionTarget === "build" && conversionProgress ? <span className="whitespace-nowrap tabular-nums">{t(conversionProgress.phase === "syncing" ? "accounts.syncingProgress" : "accounts.convertingProgress", conversionProgress)}</span> : webConversionTarget === "console" && webConsoleSyncProgress ? <span className="whitespace-nowrap tabular-nums">{t(webConsoleSyncProgress.phase === "syncing" ? "common.syncingProgress" : "common.importingProgress", webConsoleSyncProgress)}</span> : t("common.loading")}</> : t("accountConversion.start")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1466,12 +1789,12 @@ export function AccountsPage() {
       <Dialog open={quickImportOpen} onOpenChange={(open) => { setQuickImportOpen(open); if (!open) { setQuickImportTokens(""); if (quickImportFileInputRef.current) quickImportFileInputRef.current.value = ""; } }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t(provider === "grok_console" ? "console.quickImportTitle" : "accounts.quickImportTitle")}</DialogTitle>
-            <DialogDescription>{t(provider === "grok_console" ? "console.quickImportDescription" : "accounts.quickImportDescription")}</DialogDescription>
+            <DialogTitle>{t(provider === "grok_build" ? "accounts.quickImportRTTitle" : provider === "grok_console" ? "console.quickImportTitle" : "accounts.quickImportTitle")}</DialogTitle>
+            <DialogDescription>{t(provider === "grok_build" ? "accounts.quickImportRTDescription" : provider === "grok_console" ? "console.quickImportDescription" : "accounts.quickImportDescription")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="quick-sso-tokens">{t("accounts.ssoTokens")}</Label>
+              <Label htmlFor="quick-account-tokens">{t(provider === "grok_build" ? "accounts.refreshTokens" : "accounts.ssoTokens")}</Label>
               <Button type="button" variant="secondary" size="sm" disabled={importMutation.isPending} onClick={() => quickImportFileInputRef.current?.click()}><FileUp />{t("accounts.uploadTXT")}</Button>
               <input
                 ref={quickImportFileInputRef}
@@ -1485,13 +1808,13 @@ export function AccountsPage() {
               />
             </div>
             <Textarea
-              id="quick-sso-tokens"
+              id="quick-account-tokens"
               className="min-h-56 font-mono"
               autoComplete="off"
               spellCheck={false}
               value={quickImportTokens}
               onChange={(event) => setQuickImportTokens(event.target.value)}
-              placeholder={t("accounts.ssoTokenPlaceholder")}
+              placeholder={t(provider === "grok_build" ? "accounts.refreshTokenPlaceholder" : "accounts.ssoTokenPlaceholder")}
             />
           </div>
           <DialogFooter>
@@ -1960,7 +2283,19 @@ function scopeSupportsAccountProvider(scope: EgressScope, provider: AccountProvi
   return scope === "grok_web" || scope === "grok_console";
 }
 
-function AccountMetricPanel({ icon, label, value, detail, loading, tone }: { icon: ReactNode; label: string; value: string; detail: string; loading: boolean; tone: string }) {
+function accountProviderPrimaryEgressScope(provider: AccountProvider): EgressScope {
+  return provider;
+}
+
+function AccountMetricPanel({ icon, label, value, detail, detailItems, loading, tone }: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  detailItems?: Array<{ label: string; value: string; tone?: string }>;
+  loading: boolean;
+  tone: string;
+}) {
   return (
     <div className="min-h-28 rounded-lg bg-card p-4" aria-busy={loading}>
       <div className="flex min-h-5 items-center justify-between gap-3">
@@ -1968,7 +2303,18 @@ function AccountMetricPanel({ icon, label, value, detail, loading, tone }: { ico
         <span className={cn("flex size-5 items-center justify-center [&_svg]:size-4", tone)}>{icon}</span>
       </div>
       <div className="mt-3 flex min-h-8 items-center text-2xl font-medium tracking-tight tabular-nums">{loading ? <Spinner /> : value}</div>
-      <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>{detail}</p>
+      {detailItems ? (
+        <div className={cn("-ml-1.5 mt-1.5 flex min-h-5 flex-wrap gap-1 text-[11px] leading-4", loading && "invisible")} title={detail}>
+          {detailItems.map((item) => (
+            <span key={item.label} className={cn("inline-flex shrink-0 items-baseline gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5", item.tone ?? "bg-muted text-muted-foreground")}>
+              <span>{item.label}</span>
+              {item.value ? <span className="font-medium tabular-nums">{item.value}</span> : null}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>{detail}</p>
+      )}
     </div>
   );
 }

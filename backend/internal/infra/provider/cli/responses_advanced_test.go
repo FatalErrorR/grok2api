@@ -188,12 +188,18 @@ func TestResponsesWebSearchAliasesAndOptions(t *testing.T) {
 		t.Fatalf("compatibility warnings = %q", compatibility.warningHeader())
 	}
 
-	for _, supported := range []string{
-		`"filters":{"allowed_domains":["example.com"]}`,
-		`"allowed_domains":["example.com"]`,
+	for _, supported := range []struct {
+		fragment string
+		field    string
+		warning  string
+	}{
+		{fragment: `"filters":{"allowed_domains":["example.com"]}`, field: "allowed_domains"},
+		{fragment: `"allowed_domains":["example.com"]`, field: "allowed_domains", warning: "web_search_allowed_domains_normalized"},
+		{fragment: `"filters":{"excluded_domains":["example.com"]}`, field: "excluded_domains"},
+		{fragment: `"excluded_domains":["example.com"]`, field: "excluded_domains", warning: "web_search_excluded_domains_normalized"},
 	} {
 		normalized, compatibility, err = normalizeResponsesRequest([]byte(`{
-			"model":"public","input":"search","tools":[{"type":"web_search",`+supported+`}]
+			"model":"public","input":"search","tools":[{"type":"web_search",`+supported.fragment+`}]
 		}`), "grok-4.5")
 		if err != nil {
 			t.Fatal(err)
@@ -203,13 +209,54 @@ func TestResponsesWebSearchAliasesAndOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 		tool = request["tools"].([]any)[0].(map[string]any)
-		domains := tool["filters"].(map[string]any)["allowed_domains"].([]any)
+		domains := tool["filters"].(map[string]any)[supported.field].([]any)
 		if len(domains) != 1 || domains[0] != "example.com" {
-			t.Fatalf("allowed_domains 未保留: %#v", tool)
+			t.Fatalf("%s 未保留: %#v", supported.field, tool)
 		}
-		if strings.Contains(supported, `"allowed_domains"`) && !strings.Contains(supported, `"filters"`) && (compatibility == nil || !strings.Contains(compatibility.warningHeader(), "web_search_allowed_domains_normalized")) {
-			t.Fatalf("top-level allowed_domains warning = %#v", compatibility)
+		if supported.warning != "" && (compatibility == nil || !strings.Contains(compatibility.warningHeader(), supported.warning)) {
+			t.Fatalf("top-level %s warning = %#v", supported.field, compatibility)
 		}
+	}
+
+	for _, invalid := range []string{
+		`"filters":{"allowed_domains":["a.example","b.example","c.example","d.example","e.example","f.example"]}`,
+		`"filters":{"excluded_domains":["a.example","b.example","c.example","d.example","e.example","f.example"]}`,
+		`"filters":{"allowed_domains":["allow.example"],"excluded_domains":["deny.example"]}`,
+	} {
+		if _, _, err = normalizeResponsesRequest([]byte(`{
+			"model":"public","input":"search","tools":[{"type":"web_search",`+invalid+`}]
+		}`), "grok-4.5"); err == nil {
+			t.Fatalf("invalid web_search filters accepted: %s", invalid)
+		}
+	}
+
+	normalized, _, err = normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"search","tools":[{"type":"web_search","filters":{"excluded_domains":["a.example","b.example","c.example","d.example","e.example"]}}]
+	}`), "grok-4.6")
+	if err != nil {
+		t.Fatalf("five excluded domains must remain valid: %v", err)
+	}
+	request = nil
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	domains := request["tools"].([]any)[0].(map[string]any)["filters"].(map[string]any)["excluded_domains"].([]any)
+	if len(domains) != maxWebSearchDomains {
+		t.Fatalf("excluded_domains count = %d", len(domains))
+	}
+
+	normalized, _, err = normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"search","tools":[{"type":"web_search","filters":{"allowed_domains":null,"excluded_domains":[]}}]
+	}`), "grok-4.6")
+	if err != nil {
+		t.Fatalf("null/empty domain filters must remain unbounded: %v", err)
+	}
+	request = nil
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	if tool = request["tools"].([]any)[0].(map[string]any); len(tool) != 1 || tool["type"] != "web_search" {
+		t.Fatalf("empty domain filters were not omitted: %#v", tool)
 	}
 
 	for _, restricted := range []string{
@@ -349,7 +396,7 @@ func TestResponsesBuild02110NativeAndUnsupportedToolMatrix(t *testing.T) {
 			body := []byte(`{"model":"public","input":"hello","tools":[{"type":"` + kind + `"}]}`)
 			_, _, err := normalizeResponsesRequest(body, "grok-4.5")
 			requestErr, ok := err.(*responsesRequestError)
-			if !ok || requestErr.Code != "unsupported_parameter" || requestErr.Param != "tools[0].type" || !strings.Contains(requestErr.Message, "0.2.110") {
+			if !ok || requestErr.Code != "unsupported_parameter" || requestErr.Param != "tools[0].type" || !strings.Contains(requestErr.Message, "Grok Build") {
 				t.Fatalf("error = %#v", err)
 			}
 		})
@@ -534,6 +581,30 @@ func TestResponsesStreamFiltersPrivateEventsAndPreservesSSEFields(t *testing.T) 
 	}
 	if strings.Contains(text, "xai.internal") || strings.Contains(text, "private") {
 		t.Fatalf("私有事件泄露:\n%s", text)
+	}
+}
+
+func TestResponsesStreamAlwaysStripsBOMAndDoomLoopControlEvents(t *testing.T) {
+	source := "\uFEFFevent: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" +
+		"event: response.doom_loop_check\n" +
+		"data: {\"type\":\"response.doom_loop_check\",\"detected\":false}\n\n" +
+		"data: {\"type\":\"response.doom_loop_check\",\"detected\":true}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+	var compatibility *responsesToolCompatibility
+	converted, err := io.ReadAll(compatibility.normalizeResponseStream(io.NopCloser(strings.NewReader(source))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Contains(text, "\uFEFF") || strings.Contains(text, "doom_loop_check") {
+		t.Fatalf("Build private framing leaked downstream:\n%s", text)
+	}
+	for _, expected := range []string{"event: response.created", "event: response.completed", `"id":"resp_1"`} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("SSE missing %q:\n%s", expected, text)
+		}
 	}
 }
 
